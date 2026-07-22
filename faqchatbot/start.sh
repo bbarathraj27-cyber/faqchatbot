@@ -2,18 +2,9 @@
 set -e
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "Starting backend..."
-cd "$ROOT_DIR/Backend"
-uvicorn app.main:app --reload &
-BACKEND_PID=$!
-
-sleep 2
-
-echo "Starting frontend..."
 cd "$ROOT_DIR/Frontend"
-npm run dev &
-FRONTEND_PID=$!
+npm run build
 
-trap "echo 'Stopping...'; kill $BACKEND_PID $FRONTEND_PID 2>/dev/null" EXIT INT TERM
-
-wait
+cd "$ROOT_DIR/Backend"
+source venv/bin/activate
+uvicorn app.main:app --host 0.0.0.0 --port 8000

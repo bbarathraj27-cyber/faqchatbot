@@ -28,12 +28,11 @@ def ingest_website(
             all_chunks.extend(chunk_qa_pair(question=item.question, answer=cleaned, source_url=item.source_url))
         else:
             all_chunks.extend(chunk_long_text(cleaned, item.source_url))
-            
+
     if not all_chunks:
         return {
-            "pages_scraped": len(scraped_items),
-            "chunks_created": 0,
-            "topics_extracted": 0,
+            "pages_scraped": len(scraped_items), "chunks_created": 0,
+            "topics_extracted": 0, "total_words": 0,
             "status": "no content found - check your CSS selectors",
         }
     topics_per_chunk: list[list[str]] = []
@@ -45,12 +44,12 @@ def ingest_website(
             all_topics_seen.update(topics)
     else:
         topics_per_chunk = [[] for _ in all_chunks]
+    total_words = sum(len(chunk.text.split()) for chunk in all_chunks)
     texts = [chunk.text for chunk in all_chunks]
     embeddings = embed_texts(texts)
     upsert_chunks(all_chunks, embeddings, topics_per_chunk)
     return {
-        "pages_scraped": len(scraped_items),
-        "chunks_created": len(all_chunks),
-        "topics_extracted": len(all_topics_seen),
+        "pages_scraped": len(scraped_items), "chunks_created": len(all_chunks),
+        "topics_extracted": len(all_topics_seen), "total_words": total_words,
         "status": "success",
     }

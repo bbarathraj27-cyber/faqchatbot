@@ -141,3 +141,45 @@ def query_by_topics(topics: list[str], top_k: int = 5) -> list[dict]:
     except Exception as e:
         logger.warning(f"Could not query by topics: {e}")
         return []
+
+def delete_chunks_by_source(source_url: str) -> int:
+    if not _pc:
+        return 0
+    try:
+        index = _get_index()
+        zero_vector = [0.0] * settings.EMBEDDING_DIMENSION
+        results = index.query(vector=zero_vector, top_k=10000, include_metadata=False,
+                               filter={"source_url": {"$eq": source_url}})
+        ids_to_delete = [match.id for match in results.matches]
+        if not ids_to_delete:
+            return 0
+        index.delete(ids=ids_to_delete)
+        return len(ids_to_delete)
+    except Exception as e:
+        logger.warning(f"Could not delete chunks for source {source_url}: {e}")
+        return 0
+
+
+def delete_all_chunks() -> None:
+    if not _pc:
+        return
+    try:
+        index = _get_index()
+        index.delete(delete_all=True)
+    except Exception as e:
+        logger.warning(f"Could not delete all chunks: {e}")
+
+
+def get_index_stats() -> dict:
+    if not _pc:
+        return {"total_vectors": 0, "estimated_storage_mb": 0.0}
+    try:
+        index = _get_index()
+        stats = index.describe_index_stats()
+        total_vectors = stats.total_vector_count
+        bytes_per_vector = (settings.EMBEDDING_DIMENSION * 4) + 200
+        estimated_mb = round((total_vectors * bytes_per_vector) / (1024 * 1024), 2)
+        return {"total_vectors": total_vectors, "estimated_storage_mb": estimated_mb}
+    except Exception as e:
+        logger.warning(f"Could not get index stats: {e}")
+        return {"total_vectors": 0, "estimated_storage_mb": 0.0}

@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
 
+
 class Settings(BaseSettings):
     # --- App ---
     APP_NAME: str = "FAQ Chatbot"
@@ -31,7 +32,7 @@ class Settings(BaseSettings):
     CACHE_TTL_SECONDS: int = 60 * 60 * 24
 
     # --- Neo4j (knowledge graph) ---
-    NEO4J_URI:str ="neo4j+s://4b222253.databases.neo4j.io"
+    NEO4J_URI: str = "neo4j+s://416204ba.databases.neo4j.io"
     NEO4J_USERNAME: str = ""
     NEO4J_PASSWORD: str = ""
 
@@ -47,5 +48,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
+
 
 settings = Settings()

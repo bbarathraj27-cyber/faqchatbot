@@ -9,10 +9,11 @@ def create_job(total_pages: int) -> str:
     job_id = str(uuid.uuid4())
     with _lock:
         _jobs[job_id] = {
-            "status": "running",       # running | completed | failed
+            "status": "running",
             "total_pages": total_pages,
             "pages_done": 0,
             "chunks_created": 0,
+            "total_words": 0,
             "current_url": None,
             "error": None,
         }
