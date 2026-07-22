@@ -1,8 +1,12 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.database import get_db, SessionLocal
+
+logger = logging.getLogger(__name__)
 from app.models.source_model import Source
 from app.services.ingestion_pipeline import ingest_website
 from app.services.sitemap_service import analyze_site, analyze_site_deep
@@ -46,18 +50,30 @@ class RangeScrapeRequest(BaseModel):
 def scrape_faq_source(request: ScrapeRequest, db: Session = Depends(get_db)):
     if not request.urls:
         raise HTTPException(status_code=400, detail="At least one URL is required")
-    result = ingest_website(
-        urls=request.urls, question_selector=request.question_selector,
-        answer_selector=request.answer_selector, crawl=request.crawl, max_pages=request.max_pages,
-    )
-    for url in request.urls:
-        source = db.query(Source).filter(Source.url == url).first()
-        if not source:
-            source = Source(url=url)
-            db.add(source)
-        source.status = result["status"]
-        source.chunks_created = result["chunks_created"]
-    db.commit()
+
+    try:
+        result = ingest_website(
+            urls=request.urls, question_selector=request.question_selector,
+            answer_selector=request.answer_selector, crawl=request.crawl, max_pages=request.max_pages,
+        )
+    except Exception as e:
+        logger.exception("ingest_website failed")
+        raise HTTPException(status_code=500, detail=f"Ingestion pipeline failed: {e}")
+
+    try:
+        for url in request.urls:
+            source = db.query(Source).filter(Source.url == url).first()
+            if not source:
+                source = Source(url=url)
+                db.add(source)
+            source.status = result["status"]
+            source.chunks_created = result["chunks_created"]
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.exception("Failed to save source status to DB")
+        raise HTTPException(status_code=500, detail=f"Database write failed: {e}")
+
     return ScrapeResponse(**result)
 
 

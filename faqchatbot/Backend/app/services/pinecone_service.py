@@ -94,6 +94,7 @@ def query_similar_chunks(query_embedding: list[float], top_k: int = 5) -> list[d
 
         return [
             {
+                "id": match.id,
                 "text": match.metadata.get("text", ""),
                 "source_url": match.metadata.get("source_url", ""),
                 "question": match.metadata.get("question", ""),
@@ -130,6 +131,7 @@ def query_by_topics(topics: list[str], top_k: int = 5) -> list[dict]:
 
         return [
             {
+                "id": match.id,
                 "text": match.metadata.get("text", ""),
                 "source_url": match.metadata.get("source_url", ""),
                 "question": match.metadata.get("question", ""),

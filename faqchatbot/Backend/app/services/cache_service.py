@@ -8,7 +8,6 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Use Redis URL directly for Upstash (or fallback to host/port config)
 redis_client = None
 try:
     if settings.REDIS_URL:
@@ -22,7 +21,6 @@ try:
             ssl=True,
             decode_responses=True,
         )
-    # Test the connection
     redis_client.ping()
     logger.info("Redis cache connected successfully")
 except Exception as e:
@@ -35,7 +33,25 @@ def _make_key(question: str) -> str:
     return "faq:" + hashlib.sha256(normalized.encode()).hexdigest()
 
 
+def make_signature(chunk_ids: list[str]) -> str:
+    """
+    Fingerprint of the exact grounding chunks used to build an answer.
+    If a re-ingest adds, removes, or replaces any of these chunks, the
+    signature for the same question will differ on the next request —
+    that's the freshness check question_api.py uses to decide whether
+    a cached answer is still valid or must be regenerated.
+    """
+    normalized = sorted(set(chunk_ids))
+    joined = "|".join(normalized)
+    return hashlib.sha256(joined.encode()).hexdigest()
+
+
 def get_cached_answer(question: str) -> dict | None:
+    """
+    Returns the full cached record (answer + sources + signature), or None.
+    Caller is responsible for comparing the signature against fresh
+    retrieval results to decide whether the cached answer is still valid.
+    """
     if not redis_client:
         return None
     try:
@@ -47,11 +63,12 @@ def get_cached_answer(question: str) -> dict | None:
         return None
 
 
-def set_cached_answer(question: str, answer_data: dict) -> None:
+def set_cached_answer(question: str, answer_data: dict, signature: str) -> None:
     if not redis_client:
         return
     try:
         key = _make_key(question)
-        redis_client.setex(key, settings.CACHE_TTL_SECONDS, json.dumps(answer_data))
+        payload = {**answer_data, "signature": signature}
+        redis_client.setex(key, settings.CACHE_TTL_SECONDS, json.dumps(payload))
     except Exception as e:
         logger.warning(f"Cache storage failed: {e}")

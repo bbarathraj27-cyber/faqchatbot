@@ -9,6 +9,14 @@ _client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
+
+class AnswerGenerationError(Exception):
+    """Raised when the LLM call itself fails (network/API error), as opposed
+    to the LLM successfully responding with 'I don't know'. Callers use this
+    to distinguish a genuine failure (should NOT be cached) from a real,
+    grounded-or-not answer (safe to cache)."""
+
+
 def generate_answer(question: str, context_chunks: list[dict]) -> str:
     try:
         messages = build_prompt(question, context_chunks)
@@ -20,9 +28,11 @@ def generate_answer(question: str, context_chunks: list[dict]) -> str:
         return response.choices[0].message.content
     except Exception as e:
         logger.error(f"Could not generate answer from LLM: {e}")
-        if not context_chunks:
-            return f"I don't have any information about: {question}. Please check that FAQ data has been ingested."
-        return f"I encountered an error while generating an answer. Please try again."
+        # Previously this returned a fake "answer" string, which meant callers
+        # (question_api.ask_question) couldn't tell a real answer apart from a
+        # failure and ended up caching the failure for 24h. Raise instead so
+        # the caller can handle/skip-caching this case explicitly.
+        raise AnswerGenerationError(str(e)) from e
 
 
 def correct_question_spelling(question: str) -> str:

@@ -1,6 +1,7 @@
+import re
 from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -9,6 +10,53 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; FAQChatbotScraper/1.0; +https://example.com/bot-info)"
 }
 REQUEST_TIMEOUT_SECONDS = 15
+
+# Common locale codes seen either as a `?hl=` / `?lang=` query param or as a
+# leading path segment (e.g. tensorflow.org/ko/..., site.com/zh-cn/...).
+# Anything matching one of these that isn't an English variant gets skipped
+# before it's ever queued or fetched — this is what was pulling in the
+# ?hl=ko / ?hl=fr / ?hl=zh-CN / ?hl=pt-BR duplicate pages you saw in RAG
+# results.
+_ENGLISH_LOCALES = {"en", "en-us", "en-gb", "en-au", "en-ca"}
+_KNOWN_NON_ENGLISH_LOCALES = {
+    "ko", "ja", "zh", "zh-cn", "zh-tw", "fr", "de", "es", "pt", "pt-br",
+    "it", "ru", "ar", "hi", "nl", "pl", "tr", "vi", "id", "th", "sv",
+    "da", "fi", "no", "cs", "el", "he", "hu", "ro", "sk", "uk",
+}
+_LOCALE_PATH_SEGMENT_RE = re.compile(r"^[a-z]{2}(-[a-z]{2})?$")
+
+
+def is_english_url(url: str) -> bool:
+    """
+    Returns False for URLs that clearly point at a non-English locale
+    variant of a page, based on:
+      1. a `hl` or `lang` query parameter set to a known non-English code
+      2. a leading path segment that's a known non-English locale code
+         (e.g. /ko/, /zh-cn/, /fr/...)
+    Defaults to True (assume English) when neither signal is present, so
+    this never blocks normal same-language site navigation.
+    """
+    parsed = urlparse(url)
+
+    query = parse_qs(parsed.query)
+    for param_name in ("hl", "lang", "locale"):
+        values = query.get(param_name)
+        if values:
+            value = values[0].strip().lower()
+            if value in _KNOWN_NON_ENGLISH_LOCALES:
+                return False
+            if value in _ENGLISH_LOCALES:
+                return True
+
+    path_segments = [seg for seg in parsed.path.split("/") if seg]
+    if path_segments:
+        first_segment = path_segments[0].lower()
+        if first_segment in _KNOWN_NON_ENGLISH_LOCALES:
+            return False
+        if first_segment in _ENGLISH_LOCALES:
+            return True
+
+    return True
 
 
 @dataclass
@@ -65,6 +113,9 @@ def scrape_multiple_pages(
 ) -> list[ScrapedItem]:
     all_items: list[ScrapedItem] = []
     for url in urls:
+        if not is_english_url(url):
+            print(f"[scraper] Skipping non-English URL: {url}")
+            continue
         try:
             all_items.extend(scrape_faq_page(url, question_selector, answer_selector))
         except requests.RequestException as exc:
@@ -85,8 +136,11 @@ def _extract_links(base_url: str, html: str) -> list[str]:
             continue
         full_url = urljoin(base_url, href)
         full_url = full_url.split("#")[0]
-        if _same_domain(base_url, full_url):
-            links.append(full_url)
+        if not _same_domain(base_url, full_url):
+            continue
+        if not is_english_url(full_url):
+            continue
+        links.append(full_url)
     return links
 
 
@@ -97,7 +151,9 @@ def crawl_website(
     max_pages: int = 20,
 ) -> list[ScrapedItem]:
     visited: set[str] = set()
-    queue: list[str] = list(dict.fromkeys(start_urls))
+    # Filter non-English URLs out of the seed list too, so a bad start URL
+    # can't get scraped even before link-discovery filtering kicks in.
+    queue: list[str] = [u for u in dict.fromkeys(start_urls) if is_english_url(u)]
     all_items: list[ScrapedItem] = []
 
     while queue and len(visited) < max_pages:
@@ -136,6 +192,7 @@ def crawl_website(
         print(f"[crawler] Scraped ({len(visited)}/{max_pages}): {url}")
 
         try:
+            # _extract_links already filters out non-English URLs internally.
             new_links = _extract_links(url, html)
         except Exception as exc:
             print(f"[crawler] Failed to extract links from {url}: {exc}")

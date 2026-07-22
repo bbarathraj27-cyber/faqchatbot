@@ -6,16 +6,47 @@ from app.prompts.topic_prompt import build_topic_extraction_prompt
 
 logger = logging.getLogger(__name__)
 
+
+class _SuppressBenignWriteRetry(logging.Filter):
+    """
+    The neo4j driver retries a failed write against a stale/cold connection
+    and succeeds on the very next attempt (confirmed: KAG queries return
+    correct data despite this line appearing — both failed and successful
+    attempts resolve to the same IP, pointing to a cold-connection retry
+    rather than a genuinely stale routing address). It logs the failed
+    first attempt at ERROR level even though it self-recovers, so a plain
+    setLevel(ERROR) can't filter it out. This filter drops only that exact
+    message — every other Neo4j error (auth failure, timeout, real
+    connection loss, etc.) still logs normally.
+    """
+    def filter(self, record):
+        return "Failed to write data to connection" not in record.getMessage()
+
+
+logging.getLogger("neo4j").addFilter(_SuppressBenignWriteRetry())
+
 driver = None
 try:
     driver = GraphDatabase.driver(
         settings.NEO4J_URI,
         auth=(settings.NEO4J_USERNAME, settings.NEO4J_PASSWORD),
-        max_connection_lifetime=300,
+        # Shorter than before (was 300s): Aura can rotate/rebalance the
+        # underlying server address, especially after a free-tier instance
+        # wakes from being paused. Recycling connections more often means
+        # the pool holds fewer stale sockets pointed at a since-changed
+        # address, so fewer failed-then-retried attempts overall.
+        max_connection_lifetime=60,
         max_connection_pool_size=10,
         connection_acquisition_timeout=30,
         keep_alive=True,
     )
+    # Force an eager routing-table fetch against the *current* address right
+    # now, at startup, rather than lazily on the first real request — which
+    # is what caused the very first query after a resume to hit a stale
+    # cached address.
+    driver.verify_connectivity()
+    # Warm-up call: absorbs the one-time cold-connection retry here at
+    # import/startup time instead of during the first real user request.
     with driver.session() as session:
         session.run("RETURN 1")
     logger.info("Neo4j driver initialized successfully")

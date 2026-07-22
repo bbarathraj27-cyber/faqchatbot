@@ -11,6 +11,7 @@ class Settings(BaseSettings):
 
     # --- Gemini ---
     GEMINI_API_KEY: str = ""
+    GEMINI_API_KEYS: str = ""  # optional: comma-separated list of multiple keys for rotation
     EMBEDDING_MODEL: str = "gemini-embedding-001"
 
     # --- LLM ---
