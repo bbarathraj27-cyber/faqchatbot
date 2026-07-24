@@ -1,10 +1,18 @@
+import json
 import logging
 from neo4j import GraphDatabase
-from openai import OpenAI
 from app.config import settings
-from app.prompts.topic_prompt import build_topic_extraction_prompt
+from app.prompts.topic_prompt import build_topic_extraction_prompt, build_batch_topic_extraction_prompt
+from app.services.groq_key_pool import chat_completion
 
 logger = logging.getLogger(__name__)
+
+# How many chunks to bundle into a single topic-extraction LLM call during
+# ingestion. Larger batches mean fewer Groq calls, but a bigger blast radius
+# if the model's JSON response is malformed (the whole batch falls back to
+# empty topics for every chunk in it). 15 is a reasonable middle ground for
+# short (~300-token) FAQ chunks.
+TOPIC_BATCH_SIZE = 15
 
 
 class _SuppressBenignWriteRetry(logging.Filter):
@@ -30,31 +38,18 @@ try:
     driver = GraphDatabase.driver(
         settings.NEO4J_URI,
         auth=(settings.NEO4J_USERNAME, settings.NEO4J_PASSWORD),
-        # Shorter than before (was 300s): Aura can rotate/rebalance the
-        # underlying server address, especially after a free-tier instance
-        # wakes from being paused. Recycling connections more often means
-        # the pool holds fewer stale sockets pointed at a since-changed
-        # address, so fewer failed-then-retried attempts overall.
         max_connection_lifetime=60,
         max_connection_pool_size=10,
         connection_acquisition_timeout=30,
         keep_alive=True,
     )
-    # Force an eager routing-table fetch against the *current* address right
-    # now, at startup, rather than lazily on the first real request — which
-    # is what caused the very first query after a resume to hit a stale
-    # cached address.
     driver.verify_connectivity()
-    # Warm-up call: absorbs the one-time cold-connection retry here at
-    # import/startup time instead of during the first real user request.
     with driver.session() as session:
         session.run("RETURN 1")
     logger.info("Neo4j driver initialized successfully")
 except Exception as e:
     logger.warning(f"Could not initialize Neo4j driver: {e}. Knowledge graph features will be disabled.")
     driver = None
-
-_llm_client = OpenAI(api_key=settings.GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
 
 
 def _create_topic_relationship_tx(tx, topic: str, related_topic: str, source_url: str) -> None:
@@ -113,12 +108,7 @@ def extract_topics(text: str) -> list[str]:
     """
     try:
         messages = build_topic_extraction_prompt(text[:2000])
-        response = _llm_client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=messages,
-            temperature=0.0,
-        )
-        raw = response.choices[0].message.content
+        raw = chat_completion(messages, model=settings.LLM_MODEL, temperature=0.0)
         topics = [t.strip().lower() for t in raw.split(",") if t.strip()]
         return topics[:4]
     except Exception as e:
@@ -133,11 +123,79 @@ def link_topics_from_text(text: str, source_url: str) -> list[str]:
     Returns the topic list so the caller can also tag Pinecone metadata.
     """
     topics = extract_topics(text)
-    if driver:
-        try:
-            for i in range(len(topics)):
-                for j in range(i + 1, len(topics)):
-                    create_topic_relationship(topics[i], topics[j], source_url)
-        except Exception as e:
-            logger.warning(f"Could not link topics: {e}")
+    _link_topic_pairs(topics, source_url)
     return topics
+
+
+def _link_topic_pairs(topics: list[str], source_url: str) -> None:
+    if not driver or not topics:
+        return
+    try:
+        for i in range(len(topics)):
+            for j in range(i + 1, len(topics)):
+                create_topic_relationship(topics[i], topics[j], source_url)
+    except Exception as e:
+        logger.warning(f"Could not link topics: {e}")
+
+
+def extract_topics_batch(texts: list[str]) -> list[list[str]]:
+    """
+    Same as extract_topics, but for many chunks in ONE LLM call instead of
+    one call per chunk. This is the main lever for cutting Groq API usage
+    during large ingests (thousands of chunks -> one call per TOPIC_BATCH_SIZE
+    chunks instead of one call per chunk).
+
+    Falls back to per-chunk extract_topics for the whole batch if the
+    model's JSON response can't be parsed or doesn't match the expected
+    length, so a single malformed response never silently drops topics for
+    an entire batch.
+    """
+    if not texts:
+        return []
+
+    try:
+        messages = build_batch_topic_extraction_prompt([t[:2000] for t in texts])
+        content = chat_completion(messages, model=settings.LLM_MODEL, temperature=0.0)
+        raw = content.strip()
+        # Models sometimes wrap JSON in ```json fences despite instructions.
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list) or len(parsed) != len(texts):
+            raise ValueError(f"Expected {len(texts)} topic lists, got {len(parsed) if isinstance(parsed, list) else type(parsed)}")
+
+        result: list[list[str]] = []
+        for entry in parsed:
+            if isinstance(entry, list):
+                result.append([str(t).strip().lower() for t in entry if str(t).strip()][:4])
+            else:
+                result.append([])
+        return result
+    except Exception as e:
+        logger.warning(f"Batch topic extraction failed ({e}), falling back to per-chunk extraction")
+        return [extract_topics(t) for t in texts]
+
+
+def link_topics_from_texts_batch(texts: list[str], source_urls: list[str]) -> list[list[str]]:
+    """
+    Batched version of link_topics_from_text for use during bulk ingestion.
+    texts and source_urls must be the same length (one source_url per chunk).
+    Processes in groups of TOPIC_BATCH_SIZE so a single LLM call covers many
+    chunks, then links topic pairs per chunk in the graph as before.
+    """
+    if not texts:
+        return []
+
+    all_topics: list[list[str]] = []
+    for start in range(0, len(texts), TOPIC_BATCH_SIZE):
+        batch_texts = texts[start:start + TOPIC_BATCH_SIZE]
+        batch_urls = source_urls[start:start + TOPIC_BATCH_SIZE]
+        batch_topics = extract_topics_batch(batch_texts)
+        for topics, source_url in zip(batch_topics, batch_urls):
+            _link_topic_pairs(topics, source_url)
+        all_topics.extend(batch_topics)
+    return all_topics

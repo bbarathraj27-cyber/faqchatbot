@@ -21,6 +21,13 @@ class Chunk:
 def _token_count(text: str) -> int:
     return len(_encoding.encode(text))
 
+def truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """Hard-caps text to max_tokens, decoding back to a string."""
+    tokens = _encoding.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    return _encoding.decode(tokens[:max_tokens])
+
 def chunk_qa_pair(question: str, answer: str, source_url: str) -> list[Chunk]:
     combined_text = f"Q: {question}\nA: {answer}"
 

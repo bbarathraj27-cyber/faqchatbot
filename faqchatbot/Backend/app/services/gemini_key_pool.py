@@ -19,7 +19,7 @@ Usage:
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from google import genai
 
@@ -35,6 +35,8 @@ COOLDOWN_SECONDS = 60.0
 # cadence. Cooldown doubles per consecutive failure, capped here.
 MAX_COOLDOWN_SECONDS = 300.0
 
+MIN_SECONDS_BETWEEN_CALLS = 2.0
+
 
 @dataclass
 class _KeyEntry:
@@ -43,9 +45,6 @@ class _KeyEntry:
     cooldown_until: float = 0.0
     last_call_time: float = 0.0
     consecutive_failures: int = 0
-
-
-MIN_SECONDS_BETWEEN_CALLS = 2.0
 
 
 class GeminiKeyPool:
@@ -75,10 +74,15 @@ class GeminiKeyPool:
     def get_client(self):
         """
         Returns (client, label) for the next key that isn't currently in
-        cooldown, round-robin style. If every key is in cooldown, returns
-        the one that will free up soonest anyway (better to try and fail
-        fast than to block ingestion entirely).
+        cooldown, round-robin style. If every key is in cooldown, waits for
+        whichever one frees up soonest — but the wait happens OUTSIDE the
+        lock so it doesn't serialize every other thread trying to grab a
+        client at the same time.
         """
+        wait = 0.0
+        soonest_client = None
+        soonest_label = None
+
         with self._lock:
             if not self._entries:
                 return None, None
@@ -96,21 +100,35 @@ class GeminiKeyPool:
             # All keys are cooling down — pick whichever recovers soonest.
             soonest = min(self._entries, key=lambda e: e.cooldown_until)
             wait = max(0.0, soonest.cooldown_until - now)
-            logger.warning(f"All Gemini keys in cooldown, waiting {wait:.1f}s on {soonest.label}")
+            soonest_client, soonest_label = soonest.client, soonest.label
+
+        # Sleep OUTSIDE the lock so other threads aren't blocked behind us.
+        if wait > 0:
+            logger.warning(f"All Gemini keys in cooldown, waiting {wait:.1f}s on {soonest_label}")
             time.sleep(wait)
-            return soonest.client, soonest.label
+        return soonest_client, soonest_label
 
     def wait_for_rate_slot(self, label: str):
+        """
+        Simple per-key pacing so we don't fire calls on the same key faster
+        than MIN_SECONDS_BETWEEN_CALLS. The wait itself happens outside the
+        lock so concurrent workers on DIFFERENT keys never block each other,
+        and workers on the SAME key only wait as long as actually needed.
+        """
+        wait = 0.0
         with self._lock:
             entry = next((e for e in self._entries if e.label == label), None)
             if not entry:
                 return
             now = time.time()
             wait = max(0.0, MIN_SECONDS_BETWEEN_CALLS - (now - entry.last_call_time))
-            if wait > 0:
-                logger.debug("%s waiting %.2fs for rate slot", label, wait)
-                time.sleep(wait)
-            entry.last_call_time = time.time()
+            # Reserve the slot immediately so a second thread checking right
+            # behind us sees the updated last_call_time, not the stale one.
+            entry.last_call_time = now + wait
+
+        if wait > 0:
+            logger.debug("%s waiting %.2fs for rate slot", label, wait)
+            time.sleep(wait)
 
     def mark_rate_limited(self, label: str):
         with self._lock:

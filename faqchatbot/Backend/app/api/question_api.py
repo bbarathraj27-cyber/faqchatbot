@@ -1,4 +1,5 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -10,10 +11,10 @@ from app.models.feedback_model import Feedback
 from app.services.cache_service import get_cached_answer, set_cached_answer, make_signature
 from app.services.embedding_service import embed_text
 from app.services.pinecone_service import query_similar_chunks, query_by_topics
-from app.services.neo4j_service import extract_topics, get_related_topics
+from app.services.neo4j_service import get_related_topics
 from app.services.llm_service import (
     generate_answer,
-    correct_question_spelling,
+    correct_and_extract_topics,
     AnswerGenerationError,
 )
 
@@ -49,29 +50,24 @@ def _log_chat(db: Session, question: str, answer: str, sources: list[str]) -> in
             pass
         return None
 
-
-def _retrieve(corrected_question: str) -> list[dict]:
+def _retrieve(corrected_question: str, question_topics: list[str]) -> list[dict]:
     """
-    Runs RAG (Pinecone vector search) + KAG (Neo4j topic expansion) and
-    returns the deduped, combined match list. This is intentionally cheap —
-    one embedding call + one Pinecone query + graph lookups, no LLM call —
-    so it's safe to run on every request, even ones that end up being
-    served from cache. Running this first is what lets us detect whether
-    the underlying content has changed since an answer was cached.
+    Runs RAG (Pinecone vector search) + KAG (Neo4j topic expansion).
+    question_topics comes from the merged spelling+topic-extraction LLM
+    call in ask_question, instead of a separate extract_topics() call here.
     """
     query_embedding = embed_text(corrected_question)
     vector_matches = query_similar_chunks(query_embedding, top_k=5)
 
-    question_topics = extract_topics(corrected_question)
     related_topics: list[str] = []
-    for topic in question_topics:
-        related_topics.extend(get_related_topics(topic, limit=3))
+    if question_topics:
+        with ThreadPoolExecutor(max_workers=len(question_topics)) as executor:
+            for topics in executor.map(lambda t: get_related_topics(t, limit=3), question_topics):
+                related_topics.extend(topics)
     related_topics = list(set(related_topics) - set(question_topics))
 
     graph_matches = query_by_topics(related_topics, top_k=3) if related_topics else []
 
-    # Dedupe by chunk id (falls back to text) rather than raw text alone, so
-    # two distinct chunks that happen to share identical text don't collide.
     combined: dict[str, dict] = {}
     for m in vector_matches + graph_matches:
         key = m.get("id") or m["text"]
@@ -98,7 +94,7 @@ class FeedbackRequest(BaseModel):
 
 @router.post("/ask", response_model=QuestionResponse)
 def ask_question(request: QuestionRequest, db: Session = Depends(get_db)):
-    corrected_question = correct_question_spelling(request.question)
+    corrected_question, question_topics = correct_and_extract_topics(request.question)
 
     # --- Always retrieve first (RAG + KAG) ---
     # This is the freshness check: it's cheap (no LLM call), so we run it on
@@ -106,7 +102,7 @@ def ask_question(request: QuestionRequest, db: Session = Depends(get_db)):
     # content was ingested, or old chunks were replaced/deleted, the set of
     # matching chunk ids will differ from what was cached, and we know to
     # regenerate instead of serving a stale answer.
-    all_matches = _retrieve(corrected_question)
+    all_matches = _retrieve(corrected_question, question_topics)
     chunk_ids = [m.get("id") or m["text"] for m in all_matches]
     fresh_signature = make_signature(chunk_ids) if chunk_ids else None
 

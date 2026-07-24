@@ -4,7 +4,7 @@ from app.services.cleaning_service import clean_text
 from app.services.chunking_service import chunk_qa_pair, chunk_long_text, Chunk
 from app.services.embedding_service import embed_texts
 from app.services.pinecone_service import ensure_index_exists, upsert_chunks
-from app.services.neo4j_service import link_topics_from_text
+from app.services.neo4j_service import link_topics_from_texts_batch
 
 def ingest_website(
     urls: list[str],
@@ -35,15 +35,21 @@ def ingest_website(
             "topics_extracted": 0, "total_words": 0,
             "status": "no content found - check your CSS selectors",
         }
-    topics_per_chunk: list[list[str]] = []
+
     all_topics_seen = set()
     if extract_topics:
-        for chunk in all_chunks:
-            topics = link_topics_from_text(chunk.text, chunk.source_url)
-            topics_per_chunk.append(topics)
+        # Batched + parallelized: groups chunks into batches of ~15 per LLM
+        # call (instead of one call per chunk) and runs those batches
+        # concurrently across however many Groq keys are configured.
+        topics_per_chunk = link_topics_from_texts_batch(
+            [chunk.text for chunk in all_chunks],
+            [chunk.source_url for chunk in all_chunks],
+        )
+        for topics in topics_per_chunk:
             all_topics_seen.update(topics)
     else:
         topics_per_chunk = [[] for _ in all_chunks]
+
     total_words = sum(len(chunk.text.split()) for chunk in all_chunks)
     texts = [chunk.text for chunk in all_chunks]
     embeddings = embed_texts(texts)

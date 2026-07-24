@@ -1,8 +1,5 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import AnswerCard from "./AnswerCard";
-
-const RECENT_KEY = "faq_recent_searches";
-const MAX_RECENT = 8;
 
 const SUGGESTIONS = [
   "What is tf.data used for?",
@@ -41,24 +38,6 @@ function ChatBox() {
   const [conversation, setConversation] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [recent, setRecent] = useState([]);
-
-  useEffect(() => {
-    try {
-      const stored = JSON.parse(localStorage.getItem(RECENT_KEY) || "[]");
-      setRecent(stored);
-    } catch {
-      setRecent([]);
-    }
-  }, []);
-
-  const pushRecent = (q) => {
-    setRecent((prev) => {
-      const next = [q, ...prev.filter((r) => r !== q)].slice(0, MAX_RECENT);
-      localStorage.setItem(RECENT_KEY, JSON.stringify(next));
-      return next;
-    });
-  };
 
   const askQuestion = async (raw) => {
     const trimmed = raw.trim();
@@ -93,7 +72,6 @@ function ChatBox() {
         },
         ...prev,
       ]);
-      pushRecent(trimmed);
       setQuestion("");
     } catch (err) {
       console.error("Error details:", err);
@@ -146,30 +124,6 @@ function ChatBox() {
               {s}
             </button>
           ))}
-        </div>
-      )}
-
-      {/* Recent searches */}
-      {recent.length > 0 && (
-        <div className="max-w-[760px] mx-auto mt-6 text-left">
-          <p className="text-[11.5px] uppercase tracking-wider text-muted font-mono mb-2.5">
-            Recent searches
-          </p>
-          <div className="flex flex-wrap gap-2">
-            {recent.map((q) => (
-              <button
-                key={q}
-                onClick={() => askQuestion(q)}
-                className="flex items-center gap-1.5 bg-white/[0.03] border border-border text-muted text-xs px-3 py-1.5 rounded-full hover:border-borderStrong hover:text-[#eef2f5] transition"
-              >
-                <svg viewBox="0 0 24 24" className="w-2.5 h-2.5 opacity-60" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="9" />
-                  <path d="M12 7v5l3 3" />
-                </svg>
-                {q}
-              </button>
-            ))}
-          </div>
         </div>
       )}
 

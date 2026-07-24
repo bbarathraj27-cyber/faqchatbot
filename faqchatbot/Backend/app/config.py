@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     # --- LLM ---
     GROQ_API_KEY: str = ""
+    GROQ_API_KEYS: str = ""  # optional: comma-separated list of multiple keys for rotation
     LLM_MODEL: str = "openai/gpt-oss-20b"
 
     # --- Pinecone ---
@@ -45,6 +46,12 @@ class Settings(BaseSettings):
     # --- Chunking ---
     CHUNK_SIZE_TOKENS: int = 300
     CHUNK_OVERLAP_TOKENS: int = 50
+
+    # --- Tokenization budgets ---
+    MAX_CONTEXT_TOKENS: int = 3000
+    TOPIC_EXTRACTION_CHUNK_TOKENS: int = 500
+    TOPIC_BATCH_TOKEN_BUDGET: int = 5000
+    TOPIC_BATCH_CHUNK_TOKENS: int = 500
 
     class Config:
         env_file = ".env"
