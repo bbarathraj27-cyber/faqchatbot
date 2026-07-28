@@ -144,6 +144,37 @@ def query_by_topics(topics: list[str], top_k: int = 5) -> list[dict]:
         logger.warning(f"Could not query by topics: {e}")
         return []
 
+
+def get_chunks_by_source(source_url: str, top_k: int = 10000) -> list[dict]:
+    """
+    Fetches every chunk currently stored for a given source_url, including
+    its text, so callers (e.g. the verification agent) can diff it against
+    freshly scraped content without needing to keep raw text elsewhere.
+    """
+    if not _pc:
+        return []
+    try:
+        index = _get_index()
+        zero_vector = [0.0] * settings.EMBEDDING_DIMENSION
+        results = index.query(
+            vector=zero_vector,
+            top_k=top_k,
+            include_metadata=True,
+            filter={"source_url": {"$eq": source_url}},
+        )
+        return [
+            {
+                "id": match.id,
+                "text": match.metadata.get("text", ""),
+                "question": match.metadata.get("question", ""),
+            }
+            for match in results.matches
+        ]
+    except Exception as e:
+        logger.warning(f"Could not fetch chunks for source {source_url}: {e}")
+        return []
+
+
 def delete_chunks_by_source(source_url: str) -> int:
     if not _pc:
         return 0

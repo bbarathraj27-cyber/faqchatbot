@@ -40,6 +40,11 @@ function Admin() {
   const [jobStatus, setJobStatus] = useState(null);
   const pollRef = useRef(null);
 
+  // CHANGE 1: Added state
+  const [verificationStatus, setVerificationStatus] = useState(null);
+  const [runningNow, setRunningNow] = useState(false);
+  const verificationPollRef = useRef(null);
+  
   const fetchSources = async () => {
     setSourcesLoading(true);
     try {
@@ -63,10 +68,48 @@ function Admin() {
     }
   };
 
+  // CHANGE 2: Added fetch/trigger functions
+  const fetchVerificationStatus = async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/admin/verification-status`);
+      if (!response.ok) return;
+      const data = await response.json();
+      setVerificationStatus((prev) => {
+        if (data.running_pass || (prev && prev.running_pass && !data.running_pass)) {
+          fetchSources();
+          fetchDbStats();
+        }
+        return data;
+      });
+    } catch (err) {
+      console.error("Failed to load verification status:", err);
+    }
+  };
+
+  const handleRunVerificationNow = async () => {
+    setRunningNow(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/admin/verification-run-now`, { method: "POST" });
+      if (response.ok) setVerificationStatus(await response.json());
+    } catch (err) {
+      console.error("Failed to trigger verification run:", err);
+    } finally {
+      setRunningNow(false);
+    }
+  };
+
+  // CHANGE 3: Replaced existing useEffect
   useEffect(() => {
     fetchSources();
     fetchDbStats();
-    return () => clearInterval(pollRef.current);
+    fetchVerificationStatus();
+    verificationPollRef.current = setInterval(() => {
+      fetchVerificationStatus();
+    }, 10000);
+    return () => {
+      clearInterval(pollRef.current);
+      clearInterval(verificationPollRef.current);
+    };
   }, []);
 
   const handleDelete = async (sourceId) => {
@@ -517,6 +560,53 @@ function Admin() {
           </div>
         )}
       </div>
+
+      {/* CHANGE 4: Added verification status card */}
+      {verificationStatus && (
+        <div className="mb-6 rounded-xl border border-edge/40 bg-panel/40 p-4">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <h3 className="font-display text-sm font-semibold">
+                🔁 Self-healing verification agent
+              </h3>
+              <p className="text-xs text-muted mt-0.5">
+                {verificationStatus.running_pass
+                  ? `Checking source ${verificationStatus.sources_checked}/${verificationStatus.sources_total}` +
+                    (verificationStatus.current_url ? ` — ${verificationStatus.current_url}` : "")
+                  : verificationStatus.last_pass_summary
+                  ? verificationStatus.last_pass_summary
+                  : "Waiting for its first pass to start."}
+              </p>
+            </div>
+            <button
+              onClick={handleRunVerificationNow}
+              disabled={runningNow || verificationStatus.running_pass}
+              className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-edge/60 hover:border-accent2 transition disabled:opacity-40"
+            >
+              {verificationStatus.running_pass ? "Running…" : "Run now"}
+            </button>
+          </div>
+
+          {verificationStatus.running_pass && verificationStatus.sources_total > 0 && (
+            <div className="mt-3 h-1.5 rounded-full bg-edge/20 overflow-hidden">
+              <div
+                className="h-full bg-accent2 transition-all"
+                style={{
+                  width: `${(verificationStatus.sources_checked / verificationStatus.sources_total) * 100}%`,
+                }}
+              />
+            </div>
+          )}
+
+          <div className="flex flex-wrap gap-x-6 gap-y-1 mt-3 text-xs text-muted">
+            <span>Corrected this pass: <span className="text-edge font-semibold">{verificationStatus.corrected_this_pass}</span></span>
+            <span>Errors this pass: <span className="text-edge font-semibold">{verificationStatus.errors_this_pass}</span></span>
+            {verificationStatus.next_pass_at && (
+              <span>Next pass: <span className="text-edge font-semibold">{new Date(verificationStatus.next_pass_at).toLocaleString()}</span></span>
+            )}
+          </div>
+        </div>
+      )}
 
       <div>
         <div className="flex items-center justify-between mb-3 flex-wrap gap-2">

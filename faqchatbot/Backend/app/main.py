@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import Base, engine, init_redis, close_redis, get_redis
 from app.api import admin_api, question_api, source_api
+from app.services.verification_agent import verification_agent
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,11 @@ async def startup():
         logger.info("Redis connected successfully")
     except Exception as e:
         logger.warning(f"Could not connect to Redis: {e}")
+
+    try:
+        verification_agent.start()
+    except Exception as e:
+        logger.warning(f"Could not start verification agent: {e}")
 
 
 @app.on_event("shutdown")

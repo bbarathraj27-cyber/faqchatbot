@@ -72,7 +72,10 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     batch_starts = list(range(0, len(texts), batch_size))
     results: list[list[list[float]] | None] = [None] * len(batch_starts)
 
-    max_workers = max(1, len(gemini_key_pool._entries))
+    # Uses the public key_count() instead of reaching into
+    # gemini_key_pool._entries directly - same value, but doesn't depend on
+    # the pool's internal representation.
+    max_workers = max(1, gemini_key_pool.key_count())
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_idx = {}
         for idx, start in enumerate(batch_starts):

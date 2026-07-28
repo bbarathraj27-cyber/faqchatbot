@@ -37,3 +37,4 @@ httpx
 beautifulsoup4
 httpx
 beautifulsoup4
+langdetect

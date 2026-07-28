@@ -11,6 +11,7 @@ from app.models.source_model import Source
 from app.services.ingestion_pipeline import ingest_website
 from app.services.sitemap_service import analyze_site, analyze_site_deep
 from app.services.job_tracker import create_job, update_job, get_job
+from app.services.verification_agent import verification_agent
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -139,3 +140,21 @@ def scrape_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@router.get("/verification-status")
+def verification_status():
+    """Status of the background re-verification agent: whether it's mid-pass
+    right now, when its last pass finished, when the next one is scheduled
+    (2-day cooldown after each full pass), and a running tally for the
+    current pass."""
+    return verification_agent.get_status()
+
+
+@router.post("/verification-run-now")
+def verification_run_now():
+    """Wakes the verification agent immediately instead of waiting out the
+    remainder of its 2-day cooldown. If a pass is already in progress this
+    just returns its current status."""
+    verification_agent.run_once_now()
+    return verification_agent.get_status()

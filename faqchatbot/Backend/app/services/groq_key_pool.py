@@ -31,11 +31,11 @@ logger = logging.getLogger(__name__)
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 # Base cooldown after a key first gets rate-limited.
-COOLDOWN_SECONDS = 60.0
+COOLDOWN_SECONDS = 10.0
 # If the same key gets rate-limited again shortly after a previous cooldown,
 # back off harder instead of retrying it on the same losing cadence.
 # Cooldown doubles per consecutive failure, capped here.
-MAX_COOLDOWN_SECONDS = 300.0
+MAX_COOLDOWN_SECONDS = 20.0
 
 # Minimum gap between two calls made with the SAME key, so a burst of
 # requests that all happen to land on one key still gets paced instead of

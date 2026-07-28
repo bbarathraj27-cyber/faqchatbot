@@ -71,6 +71,9 @@ class GeminiKeyPool:
     def available(self) -> bool:
         return len(self._entries) > 0
 
+    def key_count(self) -> int:
+        return len(self._entries)
+
     def get_client(self):
         """
         Returns (client, label) for the next key that isn't currently in
