@@ -1,4 +1,4 @@
-#!/workspaces/faqchatbot/Backend/.venv/bin/python3.12
+#!/workspaces/faqchatbot/faqchatbot/Backend/.venv/bin/python3
 # -*- coding: utf-8 -*-
 import re
 import sys

@@ -101,14 +101,18 @@ def get_related_topics(topic: str, limit: int = 5) -> list[str]:
         return []
 
 
-def extract_topics(text: str) -> list[str]:
+def extract_topics(text: str, deadline: float | None = None) -> list[str]:
     """
     Uses the LLM to pull 2-4 topic keywords out of a chunk of text.
     Returns a clean list of lowercase topic strings.
+
+    `deadline` lets a caller (e.g. llm_service.correct_and_extract_topics'
+    fallback path) share a single retry budget with other chat_completion()
+    calls made as part of the same logical request.
     """
     try:
         messages = build_topic_extraction_prompt(text[:2000])
-        raw = chat_completion(messages, model=settings.LLM_MODEL, temperature=0.0)
+        raw = chat_completion(messages, model=settings.LLM_MODEL, temperature=0.0, deadline=deadline)
         topics = [t.strip().lower() for t in raw.split(",") if t.strip()]
         return topics[:4]
     except Exception as e:
@@ -127,13 +131,37 @@ def link_topics_from_text(text: str, source_url: str) -> list[str]:
     return topics
 
 
+def _link_topic_pairs_tx(tx, pairs: list[dict]) -> None:
+    tx.run(
+        """
+        UNWIND $pairs AS pair
+        MERGE (a:Topic {name: pair.topic})
+        MERGE (b:Topic {name: pair.related_topic})
+        MERGE (a)-[r:RELATED_TO]->(b)
+        SET r.source_url = pair.source_url
+        """,
+        pairs=pairs,
+    )
+
+
 def _link_topic_pairs(topics: list[str], source_url: str) -> None:
+    """
+    Links every pair of co-occurring topics in one round trip instead of
+    opening a new session per pair (which was O(n^2) session/round-trips
+    per chunk for chunks with several topics).
+    """
     if not driver or not topics:
         return
+    pairs = [
+        {"topic": topics[i], "related_topic": topics[j], "source_url": source_url}
+        for i in range(len(topics))
+        for j in range(i + 1, len(topics))
+    ]
+    if not pairs:
+        return
     try:
-        for i in range(len(topics)):
-            for j in range(i + 1, len(topics)):
-                create_topic_relationship(topics[i], topics[j], source_url)
+        with driver.session() as session:
+            session.execute_write(_link_topic_pairs_tx, pairs)
     except Exception as e:
         logger.warning(f"Could not link topics: {e}")
 

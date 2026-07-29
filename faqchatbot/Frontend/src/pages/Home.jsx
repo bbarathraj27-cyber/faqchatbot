@@ -1,25 +1,39 @@
+import { useState, useEffect } from "react";
 import ChatBox from "../components/ChatBox";
 import GraphBackground from "../components/GraphBackground";
 
-const TOPICS = [
-  {
-    n: "01 — CORE",
-    title: "Keras & Model Building",
-    desc: "Sequential vs functional API, layers, custom training loops.",
-  },
-  {
-    n: "02 — DATA",
-    title: "tf.data Pipelines",
-    desc: "Loading, batching, and optimizing input pipelines for training.",
-  },
-  {
-    n: "03 — DEPLOY",
-    title: "Deployment & Serving",
-    desc: "TensorFlow Lite, TF Serving, and exporting SavedModel formats.",
-  },
-];
+// Same API base URL logic used in ChatBox.jsx
+const getAPIBaseURL = () => {
+  const hostname = window.location.hostname;
+  const protocol = window.location.protocol;
+
+  if (hostname === "localhost" || hostname === "127.0.0.1") {
+    return "http://localhost:8000";
+  }
+  if (hostname.includes("app.github.dev")) {
+    return `${protocol}//${hostname.replace(/-5173\./, "-8000.")}`;
+  }
+  const origin = window.location.origin;
+  if (origin.includes(":5173")) {
+    return origin.replace(":5173", ":8000");
+  }
+  return "http://localhost:8000";
+};
+
+const API_BASE_URL = getAPIBaseURL();
 
 function Home() {
+  const [topics, setTopics] = useState([]);
+
+  // Categories are derived from what's actually been scraped and chunked,
+  // so this section never advertises a topic with no real DB content.
+  useEffect(() => {
+    fetch(`${API_BASE_URL}/sources/topics`)
+      .then((res) => (res.ok ? res.json() : { categories: [] }))
+      .then((data) => setTopics(data.categories || []))
+      .catch(() => setTopics([]));
+  }, []);
+
   return (
     <div className="relative">
       <GraphBackground />
@@ -46,6 +60,7 @@ function Home() {
           <ChatBox />
         </div>
 
+        {topics.length > 0 && (
         <section className="max-w-[1040px] mx-auto px-6 pt-24 pb-24">
           <h2 className="font-display font-bold text-3xl tracking-tight mb-2">
             Explore TensorFlow topics
@@ -54,7 +69,7 @@ function Home() {
             Jump into common areas people ask about, sourced from the official docs.
           </p>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            {TOPICS.map((t) => (
+            {topics.map((t) => (
               <div
                 key={t.title}
                 className="bg-surface border border-border rounded-2xl p-6 hover:border-accent hover:-translate-y-1 transition cursor-pointer"
@@ -66,6 +81,7 @@ function Home() {
             ))}
           </div>
         </section>
+        )}
 
         <footer className="border-t border-border py-7 text-center text-muted text-xs">
           FAQ Chatbot · powered by your ingested tensorflow.org knowledge base

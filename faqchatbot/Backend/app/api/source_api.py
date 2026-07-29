@@ -1,3 +1,5 @@
+import re
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -6,6 +8,28 @@ from app.models.source_model import Source
 from app.services import pinecone_service
 
 router = APIRouter(prefix="/sources", tags=["sources"])
+
+_CATEGORY_LABELS = {
+    "guide": ("Guides & Concepts", "Core TensorFlow concepts, APIs, and how-tos."),
+    "tutorials": ("Tutorials", "Step-by-step walkthroughs and applied examples."),
+    "api_docs": ("API Reference", "Detailed API signatures and usage."),
+    "install": ("Installation & Setup", "Getting TensorFlow installed and configured."),
+    "lite": ("TensorFlow Lite", "Mobile and edge deployment."),
+    "tfx": ("TFX & Serving", "Production pipelines and model serving."),
+    "js": ("TensorFlow.js", "Running TensorFlow in the browser and Node.js."),
+    "hub": ("TensorFlow Hub", "Reusable pretrained models."),
+}
+
+
+def _slug_to_label(url: str) -> str:
+    path = url.split("tensorflow.org", 1)[-1] if "tensorflow.org" in url else url
+    path = path.strip("/")
+    skip = {"guide", "tutorials", "api_docs", "python", "en", "lite", "js", "hub", "tfx", "install"}
+    segments = [s for s in path.split("/") if s and s not in skip]
+    slug = segments[-1] if segments else path
+    slug = re.sub(r"[-_]+", " ", slug)
+    slug = re.sub(r"\.\w+$", "", slug)
+    return slug.strip().title()
 
 
 @router.get("/")
@@ -24,6 +48,53 @@ def get_stats(db: Session = Depends(get_db)):
         "total_vectors": index_stats["total_vectors"],
         "estimated_storage_mb": index_stats["estimated_storage_mb"],
     }
+
+
+@router.get("/topics")
+def get_topics(db: Session = Depends(get_db)):
+    """
+    Derives homepage suggestions/categories directly from what's actually
+    been successfully scraped and chunked - so the frontend never shows a
+    question or topic with no grounding in the DB.
+    """
+    sources = (
+        db.query(Source)
+        .filter(Source.status == "success", Source.chunks_created > 0)
+        .order_by(Source.chunks_created.desc())
+        .all()
+    )
+
+    seen_labels = set()
+    suggestions = []
+    for s in sources:
+        label = _slug_to_label(s.url)
+        key = label.lower()
+        if not label or key in seen_labels:
+            continue
+        seen_labels.add(key)
+        suggestions.append({"label": label, "url": s.url, "chunks": s.chunks_created})
+        if len(suggestions) >= 6:
+            break
+
+    category_totals: dict[str, dict] = {}
+    for s in sources:
+        path = s.url.split("tensorflow.org", 1)[-1].strip("/") if "tensorflow.org" in s.url else "general"
+        top = path.split("/")[0] if path else "general"
+        bucket = category_totals.setdefault(top, {"chunks": 0, "pages": 0})
+        bucket["chunks"] += s.chunks_created or 0
+        bucket["pages"] += 1
+
+    ranked_categories = sorted(category_totals.items(), key=lambda kv: kv[1]["chunks"], reverse=True)[:3]
+    categories = []
+    for i, (key, info) in enumerate(ranked_categories):
+        label, desc = _CATEGORY_LABELS.get(key, (key.replace("_", " ").title(), "Explore this topic."))
+        categories.append({
+            "n": f"0{i + 1} — {key.upper()[:6]}",
+            "title": label,
+            "desc": desc,
+        })
+
+    return {"suggestions": suggestions, "categories": categories}
 
 
 @router.delete("/")

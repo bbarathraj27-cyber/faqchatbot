@@ -18,7 +18,7 @@ openai==1.35.3
 google-genai==0.3.0
 
 # Vector DB
-pinecone-client==5.0.1
+pinecone==9.1.0
 
 # Cache
 redis==5.0.6

@@ -1,10 +1,14 @@
+import logging
 import re
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; FAQChatbotScraper/1.0; +https://example.com/bot-info)"
@@ -114,12 +118,12 @@ def scrape_multiple_pages(
     all_items: list[ScrapedItem] = []
     for url in urls:
         if not is_english_url(url):
-            print(f"[scraper] Skipping non-English URL: {url}")
+            logger.info(f"[scraper] Skipping non-English URL: {url}")
             continue
         try:
             all_items.extend(scrape_faq_page(url, question_selector, answer_selector))
         except requests.RequestException as exc:
-            print(f"[scraper] Failed to scrape {url}: {exc}")
+            logger.warning(f"[scraper] Failed to scrape {url}: {exc}")
     return all_items
 
 
@@ -153,11 +157,15 @@ def crawl_website(
     visited: set[str] = set()
     # Filter non-English URLs out of the seed list too, so a bad start URL
     # can't get scraped even before link-discovery filtering kicks in.
-    queue: list[str] = [u for u in dict.fromkeys(start_urls) if is_english_url(u)]
+    # deque instead of list: popleft() is O(1) vs pop(0) being O(n), which
+    # matters once the queue grows into the hundreds/thousands of links.
+    queue: deque[str] = deque(u for u in dict.fromkeys(start_urls) if is_english_url(u))
+    queued: set[str] = set(queue)
     all_items: list[ScrapedItem] = []
 
     while queue and len(visited) < max_pages:
-        url = queue.pop(0)
+        url = queue.popleft()
+        queued.discard(url)
         if url in visited:
             continue
         visited.add(url)
@@ -165,7 +173,7 @@ def crawl_website(
         try:
             html = fetch_html(url)
         except requests.RequestException as exc:
-            print(f"[crawler] Failed to fetch {url}: {exc}")
+            logger.warning(f"[crawler] Failed to fetch {url}: {exc}")
             continue
 
         soup = BeautifulSoup(html, "lxml")
@@ -189,17 +197,18 @@ def crawl_website(
                 page_items.append(ScrapedItem(url, None, text))
 
         all_items.extend(page_items)
-        print(f"[crawler] Scraped ({len(visited)}/{max_pages}): {url}")
+        logger.info(f"[crawler] Scraped ({len(visited)}/{max_pages}): {url}")
 
         try:
             # _extract_links already filters out non-English URLs internally.
             new_links = _extract_links(url, html)
         except Exception as exc:
-            print(f"[crawler] Failed to extract links from {url}: {exc}")
+            logger.warning(f"[crawler] Failed to extract links from {url}: {exc}")
             new_links = []
 
         for link in new_links:
-            if link not in visited and link not in queue:
+            if link not in visited and link not in queued:
                 queue.append(link)
+                queued.add(link)
 
     return all_items

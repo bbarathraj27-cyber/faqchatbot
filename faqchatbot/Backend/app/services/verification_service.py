@@ -10,9 +10,9 @@ For a single Source row, this:
   4. Compares the two on word-similarity. If they're close enough, nothing
      changes (no wasted API calls). If they've drifted — the page changed,
      the old scrape was botched, whatever — it treats that as "incorrect"
-     and re-ingests: deletes the stale vectors, re-embeds the fresh chunks
-     with Gemini, re-extracts topics with Groq, and upserts the corrected
-     chunks back into Pinecone.
+     and re-ingests: re-embeds the fresh chunks with Gemini, re-extracts
+     topics with Groq, upserts the corrected chunks into Pinecone, and only
+     then deletes the stale vectors that used to represent this source.
 
 Similarity is intentionally cheap (difflib on word tokens) rather than an
 LLM call, so checking 230+ sources doesn't itself burn the API budget the
@@ -34,7 +34,7 @@ from app.services.embedding_service import embed_texts
 from app.services.neo4j_service import link_topics_from_texts_batch
 from app.services.pinecone_service import (
     get_chunks_by_source,
-    delete_chunks_by_source,
+    delete_chunks_by_ids,
     upsert_chunks,
 )
 
@@ -130,7 +130,16 @@ def verify_source(source: Source, db: Session, similarity_threshold: float = SIM
         f"[verify] {url} drifted (similarity={similarity:.2f} < {similarity_threshold}), re-ingesting"
     )
     try:
-        deleted = delete_chunks_by_source(url)
+        # Capture the OLD chunk IDs up front and delete them only AFTER the
+        # new chunks are successfully embedded and upserted. Deleting first
+        # (the old behavior) meant an embedding/upsert failure partway
+        # through left this source with zero chunks instead of
+        # stale-but-present ones. Deleting by explicit old IDs afterward
+        # (rather than delete_chunks_by_source(url) again) matters too: the
+        # new chunks share the same source_url, so a source_url-filtered
+        # delete run after the upsert would also wipe the vectors that were
+        # just written.
+        old_chunk_ids = [c["id"] for c in stored_chunks]
 
         topics_per_chunk = link_topics_from_texts_batch(
             [c.text for c in fresh_chunks],
@@ -138,6 +147,8 @@ def verify_source(source: Source, db: Session, similarity_threshold: float = SIM
         )
         embeddings = embed_texts([c.text for c in fresh_chunks])
         upsert_chunks(fresh_chunks, embeddings, topics_per_chunk)
+
+        deleted = delete_chunks_by_ids(old_chunk_ids)
 
         source.chunks_created = len(fresh_chunks)
         source.status = "success"

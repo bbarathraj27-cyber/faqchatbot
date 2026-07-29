@@ -158,12 +158,25 @@ def is_rate_limit_error(e: Exception) -> bool:
 CHAT_RETRY_BUDGET_SECONDS = 30.0
 
 
-def chat_completion(messages: list[dict], model: str, temperature: float = 0.0) -> str:
+def chat_completion(
+    messages: list[dict],
+    model: str,
+    temperature: float = 0.0,
+    deadline: float | None = None,
+) -> str:
     """
     Shared entry point for every Groq chat completion in the app. Rotates
     across the key pool and retries on rate-limit errors within a time
     budget, so callers (llm_service.py, neo4j_service.py) don't each need
     their own retry/rotation logic.
+
+    `deadline` is an optional absolute time.time() cutoff. Pass this when a
+    caller makes several chat_completion() calls as part of one logical
+    request (e.g. a combined call that falls back to two separate calls) so
+    the whole chain shares a single CHAT_RETRY_BUDGET_SECONDS budget instead
+    of each call getting its own independent 30s budget stacked on top of
+    the others. If omitted, defaults to "now + CHAT_RETRY_BUDGET_SECONDS"
+    exactly as before.
 
     Raises the last exception if every attempt within the retry budget
     fails - callers decide how to handle that (AnswerGenerationError,
@@ -172,10 +185,10 @@ def chat_completion(messages: list[dict], model: str, temperature: float = 0.0) 
     if not groq_key_pool.available():
         raise RuntimeError("No Groq API keys configured")
 
-    start_time = time.time()
+    end_time = deadline if deadline is not None else time.time() + CHAT_RETRY_BUDGET_SECONDS
     last_exc: Exception | None = None
 
-    while time.time() - start_time < CHAT_RETRY_BUDGET_SECONDS:
+    while time.time() < end_time:
         client, label = groq_key_pool.get_client()
         if client is None:
             break

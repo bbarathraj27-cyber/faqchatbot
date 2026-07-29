@@ -7,6 +7,7 @@ from app.services.chunking_service import Chunk
 logger = logging.getLogger(__name__)
 
 _pc = None
+_index = None  # cached Index client - created lazily, reused across calls
 try:
     _pc = Pinecone(api_key=settings.PINECONE_API_KEY)
     logger.info("Pinecone client initialized successfully")
@@ -32,9 +33,12 @@ def ensure_index_exists() -> None:
 
 
 def _get_index():
+    global _index
     if not _pc:
         raise RuntimeError("Pinecone is not available")
-    return _pc.Index(settings.PINECONE_INDEX_NAME)
+    if _index is None:
+        _index = _pc.Index(settings.PINECONE_INDEX_NAME)
+    return _index
 
 
 def upsert_chunks(chunks: list[Chunk], embeddings: list[list[float]], topics_per_chunk: list[list[str]] | None = None) -> None:
@@ -190,6 +194,27 @@ def delete_chunks_by_source(source_url: str) -> int:
         return len(ids_to_delete)
     except Exception as e:
         logger.warning(f"Could not delete chunks for source {source_url}: {e}")
+        return 0
+
+
+def delete_chunks_by_ids(chunk_ids: list[str]) -> int:
+    """
+    Deletes an explicit list of vector IDs, as opposed to
+    delete_chunks_by_source which deletes everything currently matching a
+    source_url filter. Used by the re-ingest/correction flow: capture the
+    OLD chunk IDs before upserting the new ones, then delete precisely
+    those old IDs afterward - since the new chunks share the same
+    source_url, a post-upsert delete_chunks_by_source(url) would also wipe
+    the vectors that were just written.
+    """
+    if not _pc or not chunk_ids:
+        return 0
+    try:
+        index = _get_index()
+        index.delete(ids=chunk_ids)
+        return len(chunk_ids)
+    except Exception as e:
+        logger.warning(f"Could not delete chunks by id: {e}")
         return 0
 
 

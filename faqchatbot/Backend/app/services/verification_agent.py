@@ -98,7 +98,44 @@ class VerificationAgent:
     # Internals
     # ---------------------------------------------------------------- #
 
+    def _seconds_until_due(self) -> float:
+        """
+        Checks the DB for the most recent last_checked_at across all sources
+        to figure out how long ago the last full pass actually finished, so a
+        server restart doesn't wipe out the cooldown and trigger an immediate
+        re-run. Returns 0 if a pass is due now (or none has ever run).
+        """
+        db = SessionLocal()
+        try:
+            latest = db.query(Source.last_checked_at).order_by(
+                Source.last_checked_at.desc()
+            ).first()
+            if not latest or not latest[0]:
+                return 0.0
+            last_checked = latest[0]
+            if last_checked.tzinfo is None:
+                last_checked = last_checked.replace(tzinfo=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - last_checked).total_seconds()
+            return max(0.0, COOLDOWN_SECONDS - elapsed)
+        finally:
+            db.close()
+
     def _loop_forever(self):
+        # On startup, don't blindly run immediately — check if a pass
+        # finished recently (survives server restarts) and wait out the rest
+        # of the cooldown first if so.
+        initial_wait = self._seconds_until_due()
+        if initial_wait > 0:
+            next_run = datetime.now(timezone.utc) + timedelta(seconds=initial_wait)
+            with self._lock:
+                self._status["next_pass_at"] = next_run.isoformat()
+            logger.info(f"Verification agent: recent pass detected, waiting {initial_wait/3600:.1f}h before next pass")
+            self._wake_event.clear()
+            deadline = time.time() + initial_wait
+            while time.time() < deadline:
+                if self._wake_event.wait(timeout=30):
+                    break
+
         while True:
             try:
                 self._run_full_pass()

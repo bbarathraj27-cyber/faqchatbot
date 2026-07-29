@@ -1,8 +1,4 @@
-import tiktoken
-
-# Same encoding chunking_service.py uses, so token counts here are
-# consistent with how chunks were sized during ingestion.
-_encoding = tiktoken.get_encoding("cl100k_base")
+from app.services.tokenizer_utils import encode as _encode, decode as _decode
 
 # Tokenization optimization: cap how many context tokens we send to the
 # LLM per answer, instead of blindly concatenating every retrieved chunk.
@@ -11,16 +7,20 @@ _encoding = tiktoken.get_encoding("cl100k_base")
 # 3,600+ tokens of context into every single answer-generation call with
 # no cap. This budget keeps cost/latency predictable and stops a future
 # change to top_k from silently ballooning prompt size.
-MAX_CONTEXT_TOKENS = 3000
+MAX_CONTEXT_TOKENS = 1500
+
 
 SYSTEM_PROMPT = """You are a helpful FAQ assistant. Answer the user's question using ONLY the
-context provided below. If the answer isn't in the context, say you don't know
-rather than guessing. Keep answers clear and concise.
+context provided below. Keep answers clear and concise.
+
+Instructions:
+- Always respond in English, no matter what language the question or context is in.
+- If the context contains non-English text, translate the relevant parts into English yourself before using it in your answer.
+- If no relevant information exists in the context, respond with exactly: "I don't know based on the available documentation."
 
 Context:
 {context}
 """
-
 
 def _build_context_text(context_chunks: list[dict]) -> str:
     """
@@ -34,12 +34,12 @@ def _build_context_text(context_chunks: list[dict]) -> str:
 
     for c in context_chunks:
         piece = f"[Source: {c['source_url']}]\n{c['text']}"
-        piece_tokens = _encoding.encode(piece)
+        piece_tokens = _encode(piece)
         remaining = MAX_CONTEXT_TOKENS - tokens_used
         if remaining <= 0:
             break
         if len(piece_tokens) > remaining:
-            piece = _encoding.decode(piece_tokens[:remaining])
+            piece = _decode(piece_tokens[:remaining])
             pieces.append(piece)
             tokens_used += remaining
             break

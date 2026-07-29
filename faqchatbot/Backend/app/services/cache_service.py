@@ -72,3 +72,39 @@ def set_cached_answer(question: str, answer_data: dict, signature: str) -> None:
         redis_client.setex(key, settings.CACHE_TTL_SECONDS, json.dumps(payload))
     except Exception as e:
         logger.warning(f"Cache storage failed: {e}")
+
+
+def _make_correction_key(raw_question: str) -> str:
+    normalized = raw_question.strip().lower()
+    return "faq:correction:" + hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def get_cached_correction(raw_question: str) -> dict | None:
+    """
+    Returns the cached {"corrected": ..., "topics": [...]} result of
+    correct_and_extract_topics() for this exact raw question, or None.
+
+    Keyed on the RAW (uncorrected) question, unlike the answer cache which
+    is keyed on the corrected question - the point is to avoid needing a
+    Groq call just to find out what the corrected question is.
+    """
+    if not redis_client:
+        return None
+    try:
+        key = _make_correction_key(raw_question)
+        cached = redis_client.get(key)
+        return json.loads(cached) if cached else None
+    except Exception as e:
+        logger.warning(f"Correction cache retrieval failed: {e}")
+        return None
+
+
+def set_cached_correction(raw_question: str, corrected: str, topics: list[str]) -> None:
+    if not redis_client:
+        return
+    try:
+        key = _make_correction_key(raw_question)
+        payload = {"corrected": corrected, "topics": topics}
+        redis_client.setex(key, settings.CACHE_TTL_SECONDS, json.dumps(payload))
+    except Exception as e:
+        logger.warning(f"Correction cache storage failed: {e}")

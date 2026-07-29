@@ -1,14 +1,5 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import AnswerCard from "./AnswerCard";
-
-const SUGGESTIONS = [
-  "What is tf.data used for?",
-  "Keras vs tf.keras — what's the difference?",
-  "How do I enable GPU support?",
-  "How to save and load a model?",
-  "What is a TensorFlow Lite model?",
-  "How do I install TensorFlow with pip?",
-];
 
 // Determine API base URL based on environment
 const getAPIBaseURL = () => {
@@ -38,6 +29,19 @@ function ChatBox() {
   const [conversation, setConversation] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [suggestions, setSuggestions] = useState([]);
+
+  // Pull suggested questions from what's actually in the DB, instead of a
+  // hardcoded list that could reference content that was never scraped.
+  useEffect(() => {
+    fetch(`${API_BASE_URL}/sources/topics`)
+      .then((res) => (res.ok ? res.json() : { suggestions: [] }))
+      .then((data) => {
+        const questions = (data.suggestions || []).map((s) => `What is ${s.label}?`);
+        setSuggestions(questions);
+      })
+      .catch(() => setSuggestions([]));
+  }, []);
 
   const askQuestion = async (raw) => {
     const trimmed = raw.trim();
@@ -112,10 +116,11 @@ function ChatBox() {
 
       {error && <p className="text-red-400 text-sm text-center mt-3">{error}</p>}
 
-      {/* Suggestions - only show before any conversation starts */}
-      {conversation.length === 0 && (
+      {/* Suggestions - only show before any conversation starts, and only
+          once we actually have DB-backed topics to suggest */}
+      {conversation.length === 0 && suggestions.length > 0 && (
         <div className="grid grid-cols-2 md:grid-cols-3 gap-3 max-w-[760px] mx-auto mt-5">
-          {SUGGESTIONS.map((s) => (
+          {suggestions.map((s) => (
             <button
               key={s}
               onClick={() => askQuestion(s)}

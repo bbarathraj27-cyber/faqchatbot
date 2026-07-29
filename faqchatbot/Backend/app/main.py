@@ -20,9 +20,17 @@ except Exception as e:
 
 app = FastAPI(title=settings.APP_NAME)
 
+# CORS_ALLOWED_ORIGINS is a comma-separated list from .env (e.g.
+# "https://myapp.com,https://admin.myapp.com"). Falls back to "*" only if
+# unset, so local dev keeps working exactly as before. Wildcard "*" combined
+# with allow_credentials=True effectively lets any origin make credentialed
+# requests - fine for local dev, risky once JWT/cookie auth is in play, so
+# this should be set to explicit origins before going public-facing.
+_cors_origins = [o.strip() for o in settings.CORS_ALLOWED_ORIGINS.split(",") if o.strip()] or ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
