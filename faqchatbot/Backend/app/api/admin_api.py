@@ -158,3 +158,19 @@ def verification_run_now():
     just returns its current status."""
     verification_agent.run_once_now()
     return verification_agent.get_status()
+
+
+@router.post("/verification-pause")
+def verification_pause():
+    """Pauses the agent. If a pass is mid-run, it finishes whichever source
+    it's currently checking, then blocks before starting the next one."""
+    verification_agent.pause()
+    return verification_agent.get_status()
+
+
+@router.post("/verification-resume")
+def verification_resume():
+    """Resumes a paused agent - it continues the same pass from wherever it
+    left off."""
+    verification_agent.resume()
+    return verification_agent.get_status()

@@ -53,9 +53,15 @@ class VerificationAgent:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._wake_event = threading.Event()  # lets "run now" skip the cooldown wait
+        # Set = not paused, work proceeds. Cleared = paused, the per-source
+        # loop in _run_full_pass blocks on this until resume() is called.
+        # Starts set (not paused) so a fresh process behaves as before.
+        self._pause_event = threading.Event()
+        self._pause_event.set()
         self._status = {
             "running_pass": False,
             "enabled": False,
+            "paused": False,
             "last_pass_started_at": None,
             "last_pass_finished_at": None,
             "next_pass_at": None,
@@ -89,6 +95,29 @@ class VerificationAgent:
         waiting out the current cooldown. If a pass is already running this
         is a no-op (the loop is already doing the work)."""
         self._wake_event.set()
+
+    def pause(self):
+        """
+        Pauses work as soon as possible. If a pass is mid-run, the
+        currently-in-flight source finishes (verify_source isn't
+        interrupted partway through - that would risk leaving a source in
+        a half-corrected state), then the loop blocks before starting the
+        next source until resume() is called. If no pass is running,
+        pausing just prevents the next pass from starting when the
+        cooldown ends.
+        """
+        with self._lock:
+            self._pause_event.clear()
+            self._status["paused"] = True
+        logger.info("Verification agent paused")
+
+    def resume(self):
+        """Resumes a paused agent - the loop picks back up exactly where it
+        left off (same pass, same source list, same counters)."""
+        with self._lock:
+            self._pause_event.set()
+            self._status["paused"] = False
+        logger.info("Verification agent resumed")
 
     def get_status(self) -> dict:
         with self._lock:
@@ -179,6 +208,12 @@ class VerificationAgent:
             corrected = 0
             errors = 0
             for i, source in enumerate(sources):
+                # Blocks here (no timeout) if pause() was called, until
+                # resume() sets the event again. Checked BEFORE starting
+                # the next source, never mid-verify_source(), so a paused
+                # agent never leaves a source half-corrected.
+                self._pause_event.wait()
+
                 with self._lock:
                     self._status["current_url"] = source.url
 

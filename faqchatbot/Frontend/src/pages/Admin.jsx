@@ -42,9 +42,10 @@ function Admin() {
 
   // CHANGE 1: Added state
   const [verificationStatus, setVerificationStatus] = useState(null);
+  const [pausing, setPausing] = useState(false);
   const [runningNow, setRunningNow] = useState(false);
   const verificationPollRef = useRef(null);
-  
+
   const fetchSources = async () => {
     setSourcesLoading(true);
     try {
@@ -95,6 +96,31 @@ function Admin() {
       console.error("Failed to trigger verification run:", err);
     } finally {
       setRunningNow(false);
+    }
+  };
+
+  // CHANGE 2b: Pause/Resume handlers for the self-healing agent
+  const handlePauseVerification = async () => {
+    setPausing(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/admin/verification-pause`, { method: "POST" });
+      if (response.ok) setVerificationStatus(await response.json());
+    } catch (err) {
+      console.error("Failed to pause verification agent:", err);
+    } finally {
+      setPausing(false);
+    }
+  };
+
+  const handleResumeVerification = async () => {
+    setPausing(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/admin/verification-resume`, { method: "POST" });
+      if (response.ok) setVerificationStatus(await response.json());
+    } catch (err) {
+      console.error("Failed to resume verification agent:", err);
+    } finally {
+      setPausing(false);
     }
   };
 
@@ -561,16 +587,24 @@ function Admin() {
         )}
       </div>
 
-      {/* CHANGE 4: Added verification status card */}
+      {/* CHANGE 4: Added verification status card, now with Pause/Resume */}
       {verificationStatus && (
         <div className="mb-6 rounded-xl border border-edge/40 bg-panel/40 p-4">
           <div className="flex items-center justify-between flex-wrap gap-2">
             <div>
-              <h3 className="font-display text-sm font-semibold">
+              <h3 className="font-display text-sm font-semibold flex items-center gap-2">
                 🔁 Self-healing verification agent
+                {verificationStatus.paused && (
+                  <span className="text-[10px] font-semibold uppercase tracking-wide px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                    Paused
+                  </span>
+                )}
               </h3>
               <p className="text-xs text-muted mt-0.5">
-                {verificationStatus.running_pass
+                {verificationStatus.paused
+                  ? `Paused` +
+                    (verificationStatus.current_url ? ` — was checking ${verificationStatus.current_url}` : "")
+                  : verificationStatus.running_pass
                   ? `Checking source ${verificationStatus.sources_checked}/${verificationStatus.sources_total}` +
                     (verificationStatus.current_url ? ` — ${verificationStatus.current_url}` : "")
                   : verificationStatus.last_pass_summary
@@ -578,16 +612,35 @@ function Admin() {
                   : "Waiting for its first pass to start."}
               </p>
             </div>
-            <button
-              onClick={handleRunVerificationNow}
-              disabled={runningNow || verificationStatus.running_pass}
-              className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-edge/60 hover:border-accent2 transition disabled:opacity-40"
-            >
-              {verificationStatus.running_pass ? "Running…" : "Run now"}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleRunVerificationNow}
+                disabled={runningNow || verificationStatus.running_pass || verificationStatus.paused}
+                className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-edge/60 hover:border-accent2 transition disabled:opacity-40"
+              >
+                {verificationStatus.running_pass ? "Running…" : "Run now"}
+              </button>
+              {verificationStatus.paused ? (
+                <button
+                  onClick={handleResumeVerification}
+                  disabled={pausing}
+                  className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-emerald-500/90 text-[#0a0e12] hover:-translate-y-0.5 transition disabled:opacity-40"
+                >
+                  {pausing ? "Resuming…" : "Resume"}
+                </button>
+              ) : (
+                <button
+                  onClick={handlePauseVerification}
+                  disabled={pausing || !verificationStatus.running_pass}
+                  className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-amber-500/50 text-amber-400 hover:bg-amber-500/10 transition disabled:opacity-40"
+                >
+                  {pausing ? "Pausing…" : "Pause"}
+                </button>
+              )}
+            </div>
           </div>
 
-          {verificationStatus.running_pass && verificationStatus.sources_total > 0 && (
+          {verificationStatus.running_pass && !verificationStatus.paused && verificationStatus.sources_total > 0 && (
             <div className="mt-3 h-1.5 rounded-full bg-edge/20 overflow-hidden">
               <div
                 className="h-full bg-accent2 transition-all"
