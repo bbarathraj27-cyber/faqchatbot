@@ -8,10 +8,12 @@ from app.database import get_db, SessionLocal
 
 logger = logging.getLogger(__name__)
 from app.models.source_model import Source
+from app.models.job_model import ScrapeJob  # noqa: F401 - registers table with Base.metadata
 from app.services.ingestion_pipeline import ingest_website
 from app.services.sitemap_service import analyze_site, analyze_site_deep
-from app.services.job_tracker import create_job, update_job, get_job
 from app.services.verification_agent import verification_agent
+from app.services.verification_service import verify_source
+from app.services import scrape_job_service
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -88,14 +90,76 @@ def analyze_site_deep_endpoint(request: AnalyzeSiteRequest):
     return analyze_site_deep(request.url)
 
 
-def _run_bulk_scrape(job_id: str, urls: list[str]):
+def _resume_sanity_check(db: Session, job: ScrapeJob, urls: list[str]) -> None:
+    """Runs right before a resumed job continues forward. Re-checks the
+    last page that was successfully completed against the live site (the
+    same drift check the self-healing verification agent uses) so a resume
+    doesn't blindly build on top of something that was actually botched.
+    Purely advisory: logged onto the job row for the admin UI, never blocks
+    the resume even if the check itself errors out."""
+    if job.current_index <= 0:
+        return
+    last_url = urls[job.current_index - 1]
+    source = db.query(Source).filter(Source.url == last_url).first()
+    if not source:
+        job.last_resume_check = f"skipped - no stored source for {last_url}"
+        return
+    try:
+        result = verify_source(source, db)
+        if result["result"] == "match":
+            job.last_resume_check = f"ok - {last_url} unchanged since it was scraped"
+        elif result["result"] == "corrected":
+            job.last_resume_check = f"re-synced - {last_url} had drifted, corrected before continuing"
+        else:
+            job.last_resume_check = f"warning - could not re-verify {last_url} ({result.get('detail', 'unknown')})"
+    except Exception as e:
+        logger.warning("Resume sanity check failed for %s", last_url, exc_info=True)
+        job.last_resume_check = f"warning - sanity check errored on {last_url}: {e}"
+    db.commit()
+
+
+def _run_bulk_scrape(job_id: str, is_resume: bool = False):
+    """Processes urls[job.current_index:] for the given job, committing
+    progress to the DB after every single page. That per-page commit is
+    what makes pause/resume/crash-recovery safe: current_index only ever
+    advances past a URL once that URL's chunks are actually stored, so
+    there's never a gap where a page is silently skipped or double-counted.
+
+    Checks pause_requested (and 3 consecutive failures for an auto-pause)
+    between pages, never mid-page - a page is always left fully done or not
+    yet started, never half-saved."""
     db = SessionLocal()
-    total_chunks = 0
-    total_words = 0
-    for i, url in enumerate(urls):
-        update_job(job_id, current_url=url)
+    job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
+    if not job:
+        db.close()
+        return
+    urls = job.urls
+    question_selector = job.question_selector
+    answer_selector = job.answer_selector
+    total_chunks = job.chunks_created
+    total_words = job.total_words
+    consecutive_errors = job.consecutive_errors or 0
+
+    if is_resume:
+        _resume_sanity_check(db, job, urls)
+
+    i = job.current_index
+    while i < len(urls):
+        db.refresh(job)
+        if job.pause_requested:
+            job.status = "paused"
+            job.pause_requested = False
+            job.current_url = None
+            db.commit()
+            db.close()
+            return
+
+        url = urls[i]
+        job.current_url = url
+        db.commit()
+
         try:
-            result = ingest_website(urls=[url], question_selector=None, answer_selector=None)
+            result = ingest_website(urls=[url], question_selector=question_selector, answer_selector=answer_selector)
             source = db.query(Source).filter(Source.url == url).first()
             if not source:
                 source = Source(url=url)
@@ -105,10 +169,41 @@ def _run_bulk_scrape(job_id: str, urls: list[str]):
             db.commit()
             total_chunks += result["chunks_created"]
             total_words += result.get("total_words", 0)
+            consecutive_errors = 0
+            i += 1
+            job.current_index = i
+            job.chunks_created = total_chunks
+            job.total_words = total_words
+            job.consecutive_errors = 0
+            db.commit()
         except Exception as e:
-            update_job(job_id, error=f"Failed on {url}: {str(e)}")
-        update_job(job_id, pages_done=i + 1, chunks_created=total_chunks, total_words=total_words)
-    update_job(job_id, status="completed", current_url=None)
+            db.rollback()
+            consecutive_errors += 1
+            err_msg = f"Failed on {url}: {e}"
+            logger.warning(err_msg)
+            job.last_error = err_msg
+            job.consecutive_errors = consecutive_errors
+            job.chunks_created = total_chunks
+            job.total_words = total_words
+            if consecutive_errors >= scrape_job_service.AUTO_PAUSE_AFTER_CONSECUTIVE_ERRORS:
+                # Don't advance current_index - this URL stays "not yet
+                # done" so resume retries it instead of skipping it, and
+                # nothing already-scraped is touched or lost.
+                job.status = "paused"
+                job.pause_requested = False
+                job.current_url = None
+                job.last_error = (
+                    f"Auto-paused after {consecutive_errors} consecutive failures "
+                    f"(likely an API key or network issue) - {err_msg}"
+                )
+                db.commit()
+                db.close()
+                return
+            db.commit()
+
+    job.status = "completed"
+    job.current_url = None
+    db.commit()
     db.close()
 
 
@@ -116,9 +211,9 @@ def _run_bulk_scrape(job_id: str, urls: list[str]):
 def scrape_bulk_async(request: BulkScrapeRequest, background_tasks: BackgroundTasks):
     if not request.urls:
         raise HTTPException(status_code=400, detail="No URLs provided")
-    job_id = create_job(total_pages=len(request.urls))
-    background_tasks.add_task(_run_bulk_scrape, job_id, request.urls)
-    return {"job_id": job_id, "total_pages": len(request.urls)}
+    job = scrape_job_service.create_job(urls=request.urls)
+    background_tasks.add_task(_run_bulk_scrape, job.id)
+    return {"job_id": job.id, "total_pages": len(request.urls)}
 
 
 @router.post("/scrape-range-async")
@@ -129,17 +224,46 @@ def scrape_range_async(request: RangeScrapeRequest, background_tasks: Background
     limited_urls = site_info["all_urls"][:request.limit]
     if not limited_urls:
         raise HTTPException(status_code=400, detail="No pages found to scrape")
-    job_id = create_job(total_pages=len(limited_urls))
-    background_tasks.add_task(_run_bulk_scrape, job_id, limited_urls)
-    return {"job_id": job_id, "total_pages": len(limited_urls)}
+    job = scrape_job_service.create_job(
+        urls=limited_urls,
+        question_selector=request.question_selector,
+        answer_selector=request.answer_selector,
+    )
+    background_tasks.add_task(_run_bulk_scrape, job.id)
+    return {"job_id": job.id, "total_pages": len(limited_urls)}
 
 
 @router.get("/scrape-status/{job_id}")
 def scrape_status(job_id: str):
-    job = get_job(job_id)
+    job = scrape_job_service.get_job_dict(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@router.get("/scrape-jobs")
+def scrape_jobs():
+    """Paused jobs that can be resumed - surfaced so the admin UI can offer
+    a 'Resume' button even after a page refresh or a backend restart, since
+    job state lives in the DB rather than in process memory."""
+    return scrape_job_service.list_resumable_jobs()
+
+
+@router.post("/scrape-pause/{job_id}")
+def scrape_pause(job_id: str):
+    job = scrape_job_service.request_pause(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@router.post("/scrape-resume/{job_id}")
+def scrape_resume(job_id: str, background_tasks: BackgroundTasks):
+    job = scrape_job_service.mark_resuming(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or not paused")
+    background_tasks.add_task(_run_bulk_scrape, job.id, True)
+    return scrape_job_service.get_job_dict(job.id)
 
 
 @router.get("/verification-status")

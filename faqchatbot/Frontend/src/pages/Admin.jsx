@@ -39,6 +39,9 @@ function Admin() {
   const [jobId, setJobId] = useState(null);
   const [jobStatus, setJobStatus] = useState(null);
   const pollRef = useRef(null);
+  const [bulkPausing, setBulkPausing] = useState(false);
+  const [bulkResuming, setBulkResuming] = useState(false);
+  const [resumableJobs, setResumableJobs] = useState([]);
 
   // CHANGE 1: Added state
   const [verificationStatus, setVerificationStatus] = useState(null);
@@ -129,6 +132,7 @@ function Admin() {
     fetchSources();
     fetchDbStats();
     fetchVerificationStatus();
+    fetchResumableJobs();
     verificationPollRef.current = setInterval(() => {
       fetchVerificationStatus();
     }, 10000);
@@ -180,15 +184,62 @@ function Admin() {
         if (!response.ok) return;
         const data = await response.json();
         setJobStatus(data);
-        if (data.status === "completed") {
+        if (data.status === "completed" || data.status === "paused") {
           clearInterval(pollRef.current);
           fetchSources();
           fetchDbStats();
+          if (data.status === "paused") fetchResumableJobs();
         }
       } catch (err) {
         console.error("Polling failed:", err);
       }
     }, 2000);
+  };
+
+  const fetchResumableJobs = async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/admin/scrape-jobs`);
+      if (!response.ok) return;
+      const data = await response.json();
+      setResumableJobs(data);
+    } catch (err) {
+      console.error("Failed to load resumable jobs:", err);
+    }
+  };
+
+  const handlePauseJob = async () => {
+    if (!jobId) return;
+    setBulkPausing(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/admin/scrape-pause/${jobId}`, { method: "POST" });
+      if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+      // The backend flips status -> "paused" only once the in-flight page
+      // finishes, so keep polling until that shows up rather than
+      // assuming it's paused immediately.
+    } catch (err) {
+      console.error("Pause request failed:", err);
+    } finally {
+      setBulkPausing(false);
+    }
+  };
+
+  const handleResumeJob = async (id) => {
+    const targetId = id || jobId;
+    if (!targetId) return;
+    setBulkResuming(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/admin/scrape-resume/${targetId}`, { method: "POST" });
+      if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+      const data = await response.json();
+      setJobId(targetId);
+      setJobStatus(data);
+      setResumableJobs((prev) => prev.filter((j) => j.job_id !== targetId));
+      pollJobStatus(targetId);
+    } catch (err) {
+      console.error("Resume request failed:", err);
+    } finally {
+      setBulkResuming(false);
+    }
   };
 
   const handleScrapeIndex = async (e) => {
@@ -547,15 +598,37 @@ function Admin() {
 
         {jobStatus && (
           <div className="bg-surface2 border border-edge/30 rounded-lg p-4 flex flex-col gap-2">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between flex-wrap gap-2">
               <p className="text-sm font-semibold text-[#eef2f5]">
-                {jobStatus.status === "completed" ? "✅ Import complete" : "⏳ Importing in background…"}
+                {jobStatus.status === "completed" && "✅ Import complete"}
+                {jobStatus.status === "running" && "⏳ Importing in background…"}
+                {jobStatus.status === "paused" && "⏸️ Paused"}
               </p>
-              <p className="text-xs text-muted">{jobStatus.pages_done} / {jobStatus.total_pages} pages</p>
+              <div className="flex items-center gap-3">
+                <p className="text-xs text-muted">{jobStatus.pages_done} / {jobStatus.total_pages} pages</p>
+                {jobStatus.status === "running" && (
+                  <button
+                    onClick={handlePauseJob}
+                    disabled={bulkPausing}
+                    className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-edge/60 hover:border-accent2 transition disabled:opacity-40"
+                  >
+                    {bulkPausing ? "Pausing…" : "Pause"}
+                  </button>
+                )}
+                {jobStatus.status === "paused" && (
+                  <button
+                    onClick={() => handleResumeJob(jobId)}
+                    disabled={bulkResuming}
+                    className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-accent text-[#0a0e12] hover:-translate-y-0.5 transition disabled:opacity-40"
+                  >
+                    {bulkResuming ? "Resuming…" : "Resume"}
+                  </button>
+                )}
+              </div>
             </div>
             <div className="w-full h-2 bg-surface rounded-full overflow-hidden">
               <div
-                className="h-full bg-edge transition-all duration-500"
+                className={`h-full transition-all duration-500 ${jobStatus.status === "paused" ? "bg-amber-500" : "bg-edge"}`}
                 style={{ width: `${(jobStatus.pages_done / jobStatus.total_pages) * 100}%` }}
               />
             </div>
@@ -578,11 +651,44 @@ function Admin() {
             {jobStatus.current_url && jobStatus.status === "running" && (
               <p className="text-xs text-muted">currently on: <span className="font-mono">{jobStatus.current_url}</span></p>
             )}
+            {jobStatus.status === "paused" && jobStatus.error && (
+              <p className="text-xs text-amber-400">{jobStatus.error}</p>
+            )}
+            {jobStatus.status === "paused" && jobStatus.last_resume_check && (
+              <p className="text-xs text-muted">last resume check: {jobStatus.last_resume_check}</p>
+            )}
+            {jobStatus.status === "paused" && (
+              <p className="text-xs text-muted">
+                Progress is saved — hit Resume any time (even after closing this tab or restarting the server) to
+                continue from page {jobStatus.pages_done + 1}.
+              </p>
+            )}
             {jobStatus.status === "completed" && (
               <button onClick={handleResetAnalysis} className="text-xs text-edge hover:underline self-start mt-1">
                 Start a new analysis
               </button>
             )}
+          </div>
+        )}
+
+        {!jobStatus && resumableJobs.length > 0 && (
+          <div className="bg-surface2 border border-amber-500/30 rounded-lg p-4 flex flex-col gap-2">
+            <p className="text-sm font-semibold text-amber-400">⏸️ You have {resumableJobs.length} paused import{resumableJobs.length > 1 ? "s" : ""}</p>
+            {resumableJobs.map((j) => (
+              <div key={j.job_id} className="flex items-center justify-between flex-wrap gap-2 text-xs">
+                <span className="text-muted">
+                  {j.pages_done} / {j.total_pages} pages done
+                  {j.error ? ` — ${j.error}` : ""}
+                </span>
+                <button
+                  onClick={() => handleResumeJob(j.job_id)}
+                  disabled={bulkResuming}
+                  className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-accent text-[#0a0e12] hover:-translate-y-0.5 transition disabled:opacity-40"
+                >
+                  {bulkResuming ? "Resuming…" : "Resume"}
+                </button>
+              </div>
+            ))}
           </div>
         )}
       </div>
