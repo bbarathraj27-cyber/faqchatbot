@@ -73,6 +73,44 @@ def set_cached_answer(question: str, answer_data: dict, signature: str) -> None:
     except Exception as e:
         logger.warning(f"Cache storage failed: {e}")
 
+def extend_cached_answer_ttl(question: str, extra_seconds: int) -> bool:
+    """
+    Called when a cached answer gets a 👍. Refreshes its Redis TTL so a
+    verified-good answer sticks around longer instead of expiring on the
+    normal CACHE_TTL_SECONDS schedule. Returns True if a cached entry was
+    found and extended, False otherwise (e.g. nothing cached for this
+    question, or it already expired).
+    """
+    if not redis_client:
+        return False
+    try:
+        key = _make_key(question)
+        if not redis_client.exists(key):
+            return False
+        redis_client.expire(key, extra_seconds)
+        return True
+    except Exception as e:
+        logger.warning(f"Cache TTL extension failed: {e}")
+        return False
+
+
+def purge_cached_answer(question: str) -> bool:
+    """
+    Called when a cached answer gets a 👎. Deletes it from Redis immediately
+    so the next person asking the same question gets a freshly regenerated
+    answer instead of the same disliked one. Returns True if a cached entry
+    was found and removed, False otherwise.
+    """
+    if not redis_client:
+        return False
+    try:
+        key = _make_key(question)
+        deleted = redis_client.delete(key)
+        return deleted > 0
+    except Exception as e:
+        logger.warning(f"Cache purge failed: {e}")
+        return False
+
 
 def _make_correction_key(raw_question: str) -> str:
     normalized = raw_question.strip().lower()

@@ -6,9 +6,16 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.config import settings
 from app.models.chat_model import ChatLog
 from app.models.feedback_model import Feedback
-from app.services.cache_service import get_cached_answer, set_cached_answer, make_signature
+from app.services.cache_service import (
+    get_cached_answer,
+    set_cached_answer,
+    make_signature,
+    extend_cached_answer_ttl,
+    purge_cached_answer,
+)
 from app.services.embedding_service import embed_text
 from app.services.pinecone_service import query_similar_chunks, query_by_topics
 from app.services.neo4j_service import get_related_topics
@@ -97,11 +104,6 @@ def ask_question(request: QuestionRequest, db: Session = Depends(get_db)):
     corrected_question, question_topics = correct_and_extract_topics(request.question)
 
     # --- Always retrieve first (RAG + KAG) ---
-    # This is the freshness check: it's cheap (no LLM call), so we run it on
-    # every request rather than blindly trusting a 24h cache entry. If new
-    # content was ingested, or old chunks were replaced/deleted, the set of
-    # matching chunk ids will differ from what was cached, and we know to
-    # regenerate instead of serving a stale answer.
     all_matches = _retrieve(corrected_question, question_topics)
     chunk_ids = [m.get("id") or m["text"] for m in all_matches]
     fresh_signature = make_signature(chunk_ids) if chunk_ids else None
@@ -122,11 +124,6 @@ def ask_question(request: QuestionRequest, db: Session = Depends(get_db)):
     try:
         answer = generate_answer(corrected_question, all_matches)
     except AnswerGenerationError:
-        # The LLM call itself failed (network/API error) — this is NOT a real
-        # answer, so it must never be written to the cache. Previously this
-        # case produced a fake "answer" string that got cached for 24h,
-        # which is exactly why the same question kept coming back with a
-        # stale "I don't have that information" cached response.
         fallback = "I'm having trouble reaching the answer service right now. Please try again in a moment."
         chat_log_id = _log_chat(db, corrected_question, fallback, [])
         return QuestionResponse(answer=fallback, sources=[], from_cache=False, chat_log_id=chat_log_id)
@@ -134,14 +131,21 @@ def ask_question(request: QuestionRequest, db: Session = Depends(get_db)):
     sources = list({m["source_url"] for m in all_matches if m["source_url"]})
     result = {"answer": answer, "sources": sources}
 
-    # Only cache answers that were actually grounded in retrieved context.
-    # If RAG/KAG retrieval came up empty (e.g. a transient Pinecone/Neo4j/
-    # embedding failure, or content genuinely not ingested yet), the LLM's
-    # honest "I don't have that information" would otherwise get locked into
-    # Redis for CACHE_TTL_SECONDS and served to every future identical
-    # question — which is the bug behind the "cached answer" screenshots.
-    if all_matches and fresh_signature:
+    _NO_ANSWER_PHRASES = (
+        "i don't know",
+        "i do not know",
+        "i don't have that information",
+        "i don't have enough information",
+        "not available in the",
+        "based on the available documentation",
+        "trouble reaching the answer service",
+    )
+    is_no_answer = any(p in answer.lower() for p in _NO_ANSWER_PHRASES)
+
+    if all_matches and fresh_signature and not is_no_answer:
         set_cached_answer(corrected_question, result, fresh_signature)
+    elif is_no_answer:
+        logger.info(f"LLM gave a 'no answer' response for '{corrected_question}', skipping cache write")
     else:
         logger.info(f"No context found for '{corrected_question}', skipping cache write")
 
@@ -163,5 +167,15 @@ def submit_feedback(request: FeedbackRequest, db: Session = Depends(get_db)):
     )
     db.add(feedback)
     db.commit()
+
+    # Make the vote actually do something to the cache, instead of just
+    # sitting unused in the feedback table:
+    #   👍 -> this cached answer is verified good, keep it around longer
+    #   👎 -> purge it now so the next person gets a freshly regenerated
+    #         answer instead of the same disliked one
+    if request.is_helpful:
+        extend_cached_answer_ttl(chat_log.question, settings.CACHE_TTL_SECONDS * 2)
+    else:
+        purge_cached_answer(chat_log.question)
 
     return {"status": "ok"}
