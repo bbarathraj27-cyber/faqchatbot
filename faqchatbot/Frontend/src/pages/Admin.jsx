@@ -38,6 +38,8 @@ function Admin() {
 
   const [jobId, setJobId] = useState(null);
   const [jobStatus, setJobStatus] = useState(null);
+  const [pausingJob, setPausingJob] = useState(false);
+  const [resumingJob, setResumingJob] = useState(false);
   const pollRef = useRef(null);
 
   // CHANGE 1: Added state
@@ -46,8 +48,9 @@ function Admin() {
   const [runningNow, setRunningNow] = useState(false);
   const verificationPollRef = useRef(null);
 
-  const fetchSources = async () => {
-    setSourcesLoading(true);
+  // FIX: added `silent` param so background refreshes don't flash "Loading..."
+  const fetchSources = async (silent = false) => {
+    if (!silent) setSourcesLoading(true);
     try {
       const response = await fetch(`${API_BASE_URL}/sources/`);
       const data = await response.json();
@@ -55,7 +58,7 @@ function Admin() {
     } catch (err) {
       console.error("Failed to load sources:", err);
     } finally {
-      setSourcesLoading(false);
+      if (!silent) setSourcesLoading(false);
     }
   };
 
@@ -70,14 +73,19 @@ function Admin() {
   };
 
   // CHANGE 2: Added fetch/trigger functions
+  // FIX: only refetch sources on the running_pass true->false transition
+  // (a pass actually finishing), not on every 10s poll while running_pass
+  // stays true (e.g. paused mid-pass) - that was causing the
+  // "Loading... / No sources ingested yet." flicker.
   const fetchVerificationStatus = async () => {
     try {
       const response = await fetch(`${API_BASE_URL}/admin/verification-status`);
       if (!response.ok) return;
       const data = await response.json();
       setVerificationStatus((prev) => {
-        if (data.running_pass || (prev && prev.running_pass && !data.running_pass)) {
-          fetchSources();
+        const justFinished = prev && prev.running_pass && !data.running_pass;
+        if (justFinished) {
+          fetchSources(true); // silent: don't flash the loading state
           fetchDbStats();
         }
         return data;
@@ -180,7 +188,7 @@ function Admin() {
         if (!response.ok) return;
         const data = await response.json();
         setJobStatus(data);
-        if (data.status === "completed") {
+        if (data.status === "completed" || data.status === "paused") {
           clearInterval(pollRef.current);
           fetchSources();
           fetchDbStats();
@@ -189,6 +197,34 @@ function Admin() {
         console.error("Polling failed:", err);
       }
     }, 2000);
+  };
+
+  const handlePauseJob = async () => {
+    if (!jobId) return;
+    setPausingJob(true);
+    try {
+      await fetch(`${API_BASE_URL}/admin/scrape-pause/${jobId}`, { method: "POST" });
+      if (!pollRef.current) pollJobStatus(jobId);
+    } catch (err) {
+      console.error("Failed to pause job:", err);
+    } finally {
+      setPausingJob(false);
+    }
+  };
+
+  const handleResumeJob = async () => {
+    if (!jobId) return;
+    setResumingJob(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/admin/scrape-resume/${jobId}`, { method: "POST" });
+      if (!response.ok) throw new Error(`Resume failed with status ${response.status}`);
+      setJobStatus((prev) => (prev ? { ...prev, status: "running" } : prev));
+      pollJobStatus(jobId);
+    } catch (err) {
+      console.error("Failed to resume job:", err);
+    } finally {
+      setResumingJob(false);
+    }
   };
 
   const handleScrapeIndex = async (e) => {
@@ -547,15 +583,37 @@ function Admin() {
 
         {jobStatus && (
           <div className="bg-surface2 border border-edge/30 rounded-lg p-4 flex flex-col gap-2">
-            <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between">
               <p className="text-sm font-semibold text-[#eef2f5]">
-                {jobStatus.status === "completed" ? "✅ Import complete" : "⏳ Importing in background…"}
+                {jobStatus.status === "completed" && "✅ Import complete"}
+                {jobStatus.status === "running" && "⏳ Importing in background…"}
+                {jobStatus.status === "paused" && "⏸ Paused"}
               </p>
-              <p className="text-xs text-muted">{jobStatus.pages_done} / {jobStatus.total_pages} pages</p>
+              <div className="flex items-center gap-2">
+                <p className="text-xs text-muted">{jobStatus.pages_done} / {jobStatus.total_pages} pages</p>
+                {jobStatus.status === "running" && (
+                  <button
+                    onClick={handlePauseJob}
+                    disabled={pausingJob}
+                    className="text-xs px-2 py-1 rounded-md border border-border hover:border-borderStrong disabled:opacity-50"
+                  >
+                    {pausingJob ? "Pausing…" : "⏸ Pause"}
+                  </button>
+                )}
+                {jobStatus.status === "paused" && (
+                  <button
+                    onClick={handleResumeJob}
+                    disabled={resumingJob}
+                    className="text-xs px-2 py-1 rounded-md border border-accent2/40 text-accent2 hover:bg-accent2/10 disabled:opacity-50"
+                  >
+                    {resumingJob ? "Resuming…" : "▶ Resume"}
+                  </button>
+                )}
+              </div>
             </div>
             <div className="w-full h-2 bg-surface rounded-full overflow-hidden">
               <div
-                className="h-full bg-edge transition-all duration-500"
+                className={`h-full transition-all duration-500 ${jobStatus.status === "paused" ? "bg-muted" : "bg-edge"}`}
                 style={{ width: `${(jobStatus.pages_done / jobStatus.total_pages) * 100}%` }}
               />
             </div>
@@ -577,6 +635,9 @@ function Admin() {
 
             {jobStatus.current_url && jobStatus.status === "running" && (
               <p className="text-xs text-muted">currently on: <span className="font-mono">{jobStatus.current_url}</span></p>
+            )}
+            {jobStatus.status === "paused" && jobStatus.error && (
+              <p className="text-xs text-amber-400">{jobStatus.error}</p>
             )}
             {jobStatus.status === "completed" && (
               <button onClick={handleResetAnalysis} className="text-xs text-edge hover:underline self-start mt-1">

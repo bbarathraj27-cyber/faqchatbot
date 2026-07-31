@@ -57,30 +57,40 @@ def _log_chat(db: Session, question: str, answer: str, sources: list[str]) -> in
             pass
         return None
 
-def _retrieve(corrected_question: str, question_topics: list[str]) -> list[dict]:
-    """
-    Runs RAG (Pinecone vector search) + KAG (Neo4j topic expansion).
-    question_topics comes from the merged spelling+topic-extraction LLM
-    call in ask_question, instead of a separate extract_topics() call here.
-    """
+def _vector_search(corrected_question: str) -> list[dict]:
+    """RAG leg: embed the question, then search Pinecone by vector similarity."""
     query_embedding = embed_text(corrected_question)
-    vector_matches = query_similar_chunks(query_embedding, top_k=5)
+    return query_similar_chunks(query_embedding, top_k=5)
 
+
+def _graph_search(question_topics: list[str]) -> list[dict]:
+    """KAG leg: expand the question's topics via Neo4j, then search Pinecone by topic match."""
     related_topics: list[str] = []
     if question_topics:
         with ThreadPoolExecutor(max_workers=len(question_topics)) as executor:
             for topics in executor.map(lambda t: get_related_topics(t, limit=3), question_topics):
                 related_topics.extend(topics)
     related_topics = list(set(related_topics) - set(question_topics))
+    return query_by_topics(related_topics, top_k=3) if related_topics else []
 
-    graph_matches = query_by_topics(related_topics, top_k=3) if related_topics else []
+
+def _retrieve(corrected_question: str, question_topics: list[str]) -> list[dict]:
+    """
+    Runs RAG (Pinecone vector search) + KAG (Neo4j topic expansion).
+    The two legs run concurrently since they don't depend on each other -
+    only on corrected_question/question_topics, both already available.
+    """
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        vector_future = executor.submit(_vector_search, corrected_question)
+        graph_future = executor.submit(_graph_search, question_topics)
+        vector_matches = vector_future.result()
+        graph_matches = graph_future.result()
 
     combined: dict[str, dict] = {}
     for m in vector_matches + graph_matches:
         key = m.get("id") or m["text"]
         combined.setdefault(key, m)
     return list(combined.values())
-
 
 class QuestionRequest(BaseModel):
     question: str

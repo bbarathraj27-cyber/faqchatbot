@@ -27,7 +27,7 @@ def _purge_expired_locked() -> None:
         del _jobs[job_id]
 
 
-def create_job(total_pages: int) -> str:
+def create_job(total_pages: int, urls: list[str] | None = None) -> str:
     job_id = str(uuid.uuid4())
     with _lock:
         _purge_expired_locked()
@@ -39,6 +39,9 @@ def create_job(total_pages: int) -> str:
             "total_words": 0,
             "current_url": None,
             "error": None,
+            "resume_index": 0,
+            "_urls": urls or [],
+            "_pause_requested": False,
             "_updated_at": time.time(),
         }
     return job_id
@@ -52,10 +55,42 @@ def update_job(job_id: str, **kwargs):
         _purge_expired_locked()
 
 
+def request_pause(job_id: str) -> bool:
+    """Flags a running job to pause before it starts its next page. The
+    background loop checks this flag between pages (never mid-page), so
+    a page that's already downloading/embedding always finishes and gets
+    saved before the job actually stops."""
+    with _lock:
+        if job_id not in _jobs:
+            return False
+        _jobs[job_id]["_pause_requested"] = True
+        _jobs[job_id]["_updated_at"] = time.time()
+        return True
+
+
+def consume_pause_request(job_id: str) -> bool:
+    """Checks and clears the pause flag in one step, so a stray resume
+    doesn't immediately re-trigger the same pause request."""
+    with _lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return False
+        was_requested = job.get("_pause_requested", False)
+        job["_pause_requested"] = False
+        return was_requested
+
+
 def get_job(job_id: str) -> dict | None:
     with _lock:
         job = _jobs.get(job_id)
         if job is None:
             return None
-        # Don't leak the internal bookkeeping field to callers/API responses.
-        return {k: v for k, v in job.items() if k != "_updated_at"}
+        # Don't leak internal bookkeeping fields to callers/API responses.
+        return {k: v for k, v in job.items() if k not in ("_updated_at", "_pause_requested", "_urls")}
+
+
+def get_job_urls(job_id: str) -> list[str] | None:
+    """Internal use only (resume needs the original URL list back)."""
+    with _lock:
+        job = _jobs.get(job_id)
+        return job.get("_urls") if job else None

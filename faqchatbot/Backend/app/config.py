@@ -9,10 +9,19 @@ class Settings(BaseSettings):
     # --- PostgreSQL ---
     DATABASE_URL: str = ""
 
-    # --- Gemini ---
+    # --- Gemini (embeddings) ---
     GEMINI_API_KEY: str = ""
     GEMINI_API_KEYS: str = ""  # optional: comma-separated list of multiple keys for rotation
     EMBEDDING_MODEL: str = "gemini-embedding-001"
+
+    # --- Gemini (LLM fallback, used only when Groq fails) ---
+    # Dedicated key pool for chat fallback, kept separate from GEMINI_API_KEYS
+    # (embeddings) so a heavy ingest run hammering the embedding pool can
+    # never starve out a live chat fallback. If left empty, falls back to
+    # reusing GEMINI_API_KEYS (see gemini_llm_key_pool.py _resolve_keys()).
+    GEMINI_LLM_API_KEYS: str = ""
+    GEMINI_LLM_MODEL: str = "gemini-2.5-flash"
+    LLM_FALLBACK_TO_GEMINI: bool = True
 
     # --- LLM ---
     GROQ_API_KEY: str = ""
@@ -48,17 +57,11 @@ class Settings(BaseSettings):
     CHUNK_OVERLAP_TOKENS: int = 50
 
     # --- Tokenization budgets ---
-    # NOTE: MAX_CONTEXT_TOKENS lives in app/prompts/faq_prompt.py, not here -
-    # this used to be duplicated in both places (and out of sync: 3000 here
-    # vs whatever faq_prompt.py had), which was just confusing. Removed.
     TOPIC_EXTRACTION_CHUNK_TOKENS: int = 500
     TOPIC_BATCH_TOKEN_BUDGET: int = 5000
     TOPIC_BATCH_CHUNK_TOKENS: int = 500
 
     # --- CORS ---
-    # Comma-separated list of allowed origins, e.g.
-    # "https://myapp.com,https://admin.myapp.com". Falls back to "*" (allow
-    # any origin) only when unset, so local dev keeps working untouched.
     CORS_ALLOWED_ORIGINS: str = "*"
 
     class Config:

@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass
 
 from google import genai
+from google.genai import types
 
 from app.config import settings
 
@@ -35,7 +36,7 @@ COOLDOWN_SECONDS = 60.0
 # cadence. Cooldown doubles per consecutive failure, capped here.
 MAX_COOLDOWN_SECONDS = 300.0
 
-MIN_SECONDS_BETWEEN_CALLS = 2.0
+MIN_SECONDS_BETWEEN_CALLS = 10.0
 
 
 @dataclass
@@ -170,3 +171,76 @@ def _resolve_keys() -> list[str]:
 
 
 gemini_key_pool = GeminiKeyPool(_resolve_keys())
+
+# ---------------------------------------------------------------------------
+# Chat completion (used as a FALLBACK when the Groq key pool is exhausted —
+# see groq_key_pool.chat_completion). Reuses the same key pool / cooldown
+# machinery as embed_text, just pointed at generate_content instead of
+# embed_content.
+# ---------------------------------------------------------------------------
+
+CHAT_FALLBACK_RETRY_BUDGET_SECONDS = 5.0
+
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    msg = str(e)
+    return "RESOURCE_EXHAUSTED" in msg or "429" in msg
+
+
+def _messages_to_gemini(messages: list[dict]) -> tuple[str | None, list["types.Content"]]:
+    system_parts: list[str] = []
+    contents: list[types.Content] = []
+
+    for m in messages:
+        role = m.get("role")
+        text = m.get("content", "")
+        if role == "system":
+            system_parts.append(text)
+        else:
+            gemini_role = "model" if role == "assistant" else "user"
+            contents.append(types.Content(role=gemini_role, parts=[types.Part(text=text)]))
+
+    system_instruction = "\n\n".join(system_parts) if system_parts else None
+    return system_instruction, contents
+
+
+def chat_completion(
+    messages: list[dict],
+    model: str | None = None,
+    temperature: float = 0.0,
+    deadline: float | None = None,
+) -> str:
+    if not gemini_key_pool.available():
+        raise RuntimeError("No valid Gemini API keys configured (all keys missing)")
+
+    model = model or settings.GEMINI_LLM_MODEL
+    system_instruction, contents = _messages_to_gemini(messages)
+
+    end_time = deadline if deadline is not None else time.time() + CHAT_FALLBACK_RETRY_BUDGET_SECONDS
+    last_exc: Exception | None = None
+
+    while time.time() < end_time:
+        client, label = gemini_key_pool.get_client()
+        if client is None:
+            break
+        gemini_key_pool.wait_for_rate_slot(label)
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=temperature,
+                ),
+            )
+            gemini_key_pool.mark_success(label)
+            return response.text
+        except Exception as e:
+            last_exc = e
+            if _is_rate_limit_error(e):
+                gemini_key_pool.mark_rate_limited(label)
+                continue
+            else:
+                raise
+
+    raise last_exc or RuntimeError("Gemini chat completion failed with no keys available")

@@ -218,39 +218,55 @@ def chat_completion(
     the others. If omitted, defaults to "now + CHAT_RETRY_BUDGET_SECONDS"
     exactly as before.
 
-    Raises the last exception if every attempt within the retry budget
-    fails - callers decide how to handle that (AnswerGenerationError,
-    fall back to original text, etc).
-    """
-    if not groq_key_pool.available():
-        raise RuntimeError("No valid Groq API keys configured (all keys missing or invalid)")
+   If every Groq key is exhausted/invalid/rate-limited and
+    settings.LLM_FALLBACK_TO_GEMINI is True, this falls back to Gemini
+    (app.services.gemini_key_pool.chat_completion) using the same messages,
+    before finally raising.
 
-    end_time = deadline if deadline is not None else time.time() + CHAT_RETRY_BUDGET_SECONDS
+    Raises the last exception if every attempt (Groq, then the Gemini
+    fallback if applicable) fails - callers decide how to handle that
+    (AnswerGenerationError, fall back to original text, etc).
+    """
     last_exc: Exception | None = None
 
-    while time.time() < end_time:
-        client, label = groq_key_pool.get_client()
-        if client is None:
-            break
+    if groq_key_pool.available():
+        end_time = deadline if deadline is not None else time.time() + CHAT_RETRY_BUDGET_SECONDS
+
+        while time.time() < end_time:
+            client, label = groq_key_pool.get_client()
+            if client is None:
+                break
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                )
+                groq_key_pool.mark_success(label)
+                return response.choices[0].message.content
+            except Exception as e:
+                last_exc = e
+                if is_invalid_key_error(e):
+                    groq_key_pool.mark_invalid(label)
+                    continue
+                elif is_rate_limit_error(e):
+                    groq_key_pool.mark_rate_limited(label)
+                    continue
+                else:
+                    raise
+    else:
+        last_exc = RuntimeError("No valid Groq API keys configured (all keys missing or invalid)")
+
+    if settings.LLM_FALLBACK_TO_GEMINI:
+        logger.warning(
+            "Groq exhausted/unavailable for this call, falling back to Gemini: %s", last_exc
+        )
+        from app.services.gemini_key_pool import chat_completion as gemini_chat_completion
+
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-            )
-            groq_key_pool.mark_success(label)
-            return response.choices[0].message.content
-        except Exception as e:
-            last_exc = e
-            if is_invalid_key_error(e):
-                groq_key_pool.mark_invalid(label)
-                continue  # try the next key immediately, this one is permanently done
-            elif is_rate_limit_error(e):
-                groq_key_pool.mark_rate_limited(label)
-                continue  # get_client() paces/rotates us to the next key
-            else:
-                # Some other error (bad request, network issue, etc.) -
-                # retrying the same way won't help.
-                raise
+            return gemini_chat_completion(messages, temperature=temperature)
+        except Exception as gemini_exc:
+            logger.error(f"Gemini fallback also failed: {gemini_exc}")
+            last_exc = gemini_exc
 
     raise last_exc or RuntimeError("Groq chat completion failed with no keys available")
