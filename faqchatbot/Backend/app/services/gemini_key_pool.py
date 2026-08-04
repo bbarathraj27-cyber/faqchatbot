@@ -25,6 +25,7 @@ from google import genai
 from google.genai import types
 
 from app.config import settings
+from app.services import control_signal
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,7 @@ class GeminiKeyPool:
         # Sleep OUTSIDE the lock so other threads aren't blocked behind us.
         if wait > 0:
             logger.warning(f"All Gemini keys in cooldown, waiting {wait:.1f}s on {soonest_label}")
-            time.sleep(wait)
+            control_signal.interruptible_sleep(wait)
         return soonest_client, soonest_label
 
     def wait_for_rate_slot(self, label: str):
@@ -132,7 +133,7 @@ class GeminiKeyPool:
 
         if wait > 0:
             logger.debug("%s waiting %.2fs for rate slot", label, wait)
-            time.sleep(wait)
+            control_signal.interruptible_sleep(wait)
 
     def mark_rate_limited(self, label: str):
         with self._lock:

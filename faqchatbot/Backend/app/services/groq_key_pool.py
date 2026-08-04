@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from openai import OpenAI
 
 from app.config import settings
+from app.services import control_signal
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +124,7 @@ class GroqKeyPool:
             soonest = min(active, key=lambda e: e.cooldown_until)
             wait = max(0.0, soonest.cooldown_until - now)
             logger.warning(f"All Groq keys in cooldown, waiting {wait:.1f}s on {soonest.label}")
-            time.sleep(wait)
+            control_signal.interruptible_sleep(wait)
             soonest.last_call_time = time.time()
             return soonest.client, soonest.label
 

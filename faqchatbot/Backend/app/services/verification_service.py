@@ -107,12 +107,22 @@ def _safe_commit(db: Session, url: str) -> bool:
         return False
 
 
-def verify_source(source: Source, db: Session, similarity_threshold: float = SIMILARITY_THRESHOLD) -> dict:
+def verify_source(source: Source, db: Session, similarity_threshold: float = SIMILARITY_THRESHOLD, correct_on_drift: bool = True) -> dict:
     """
     Checks one Source against its live webpage and corrects it in place if
     the stored content has drifted. Always attempts to commit an updated
     last_checked_at / last_check_result / last_similarity_score on the
     Source row, even on failure, so the admin UI reflects reality.
+
+    correct_on_drift: when False, a detected drift is reported (result=
+    "drifted") but NOT acted on - no re-scrape-driven re-ingest, no Groq/
+    Gemini calls. Use this for lightweight callers (like the bulk-scrape
+    resume sanity check) that just want a quick "did this change" signal
+    and can't afford to block on a potentially several-minutes-long
+    correction cycle (topic extraction + re-embedding, both of which retry
+    for a while if the key pools are still rate-limited). The background
+    self-healing verification agent is the right place for actual
+    corrections - it runs independently and isn't blocking anything.
 
     Returns a small result dict for the caller (agent loop) to aggregate.
     """
@@ -157,7 +167,18 @@ def verify_source(source: Source, db: Session, similarity_threshold: float = SIM
             return {"url": url, "result": "skipped", "detail": "source deleted before commit"}
         return {"url": url, "result": "match", "similarity": similarity}
 
-    # --- Drift detected: correct it ---
+    # --- Drift detected ---
+    if not correct_on_drift:
+        source.last_check_result = "drifted"
+        if not _safe_commit(db, url):
+            return {"url": url, "result": "skipped", "detail": "source deleted before commit"}
+        logger.info(
+            f"[verify] {url} drifted (similarity={similarity:.2f} < {similarity_threshold}) - "
+            f"correction skipped (correct_on_drift=False), will be caught by the next full "
+            f"verification pass instead"
+        )
+        return {"url": url, "result": "drifted", "similarity": similarity}
+
     logger.info(
         f"[verify] {url} drifted (similarity={similarity:.2f} < {similarity_threshold}), re-ingesting"
     )
