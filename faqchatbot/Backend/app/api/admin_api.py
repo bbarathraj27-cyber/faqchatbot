@@ -8,9 +8,10 @@ from app.database import get_db, SessionLocal
 
 logger = logging.getLogger(__name__)
 from app.models.source_model import Source
-from app.models.job_model import ScrapeJob  # noqa: F401 - registers table with Base.metadata
+from app.models.job_model import ScrapeJob  # noqa: F401
 from app.services.ingestion_pipeline import ingest_website
 from app.services.sitemap_service import analyze_site, analyze_site_deep
+from app.services.language_detection import filter_urls_by_language
 from app.services.verification_agent import verification_agent
 from app.services.verification_service import verify_source
 from app.services import scrape_job_service
@@ -40,6 +41,12 @@ class BulkScrapeRequest(BaseModel):
 
 class AnalyzeSiteRequest(BaseModel):
     url: str = Field(...)
+    urls: list[str] | None = Field(default=None)
+
+
+class FilterUrlsRequest(BaseModel):
+    urls: list[str] = Field(...)
+    languages: list[str] = Field(...)
 
 
 class RangeScrapeRequest(BaseModel):
@@ -87,16 +94,16 @@ def analyze_site_endpoint(request: AnalyzeSiteRequest):
 
 @router.post("/analyze-site-deep")
 def analyze_site_deep_endpoint(request: AnalyzeSiteRequest):
-    return analyze_site_deep(request.url)
+    return analyze_site_deep(request.url, urls_override=request.urls)
+
+
+@router.post("/filter-urls-by-language")
+def filter_urls_by_language_endpoint(request: FilterUrlsRequest):
+    filtered = filter_urls_by_language(request.urls, request.languages)
+    return {"urls": filtered, "count": len(filtered)}
 
 
 def _resume_sanity_check(db: Session, job: ScrapeJob, urls: list[str]) -> None:
-    """Runs right before a resumed job continues forward. Re-checks the
-    last page that was successfully completed against the live site (the
-    same drift check the self-healing verification agent uses) so a resume
-    doesn't blindly build on top of something that was actually botched.
-    Purely advisory: logged onto the job row for the admin UI, never blocks
-    the resume even if the check itself errors out."""
     if job.current_index <= 0:
         return
     last_url = urls[job.current_index - 1]
@@ -119,15 +126,6 @@ def _resume_sanity_check(db: Session, job: ScrapeJob, urls: list[str]) -> None:
 
 
 def _run_bulk_scrape(job_id: str, is_resume: bool = False):
-    """Processes urls[job.current_index:] for the given job, committing
-    progress to the DB after every single page. That per-page commit is
-    what makes pause/resume/crash-recovery safe: current_index only ever
-    advances past a URL once that URL's chunks are actually stored, so
-    there's never a gap where a page is silently skipped or double-counted.
-
-    Checks pause_requested (and 3 consecutive failures for an auto-pause)
-    between pages, never mid-page - a page is always left fully done or not
-    yet started, never half-saved."""
     db = SessionLocal()
     job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
     if not job:
@@ -145,8 +143,21 @@ def _run_bulk_scrape(job_id: str, is_resume: bool = False):
 
     i = job.current_index
     while i < len(urls):
-        db.refresh(job)
-        if job.pause_requested:
+        signal = scrape_job_service.get_control_signal(job_id)
+        if not signal:
+            db.close()
+            return
+
+        if signal["cancel_requested"]:
+            job.status = "cancelled"
+            job.pause_requested = False
+            job.cancel_requested = False
+            job.current_url = None
+            db.commit()
+            db.close()
+            return
+
+        if signal["pause_requested"]:
             job.status = "paused"
             job.pause_requested = False
             job.current_url = None
@@ -186,9 +197,6 @@ def _run_bulk_scrape(job_id: str, is_resume: bool = False):
             job.chunks_created = total_chunks
             job.total_words = total_words
             if consecutive_errors >= scrape_job_service.AUTO_PAUSE_AFTER_CONSECUTIVE_ERRORS:
-                # Don't advance current_index - this URL stays "not yet
-                # done" so resume retries it instead of skipping it, and
-                # nothing already-scraped is touched or lost.
                 job.status = "paused"
                 job.pause_requested = False
                 job.current_url = None
@@ -243,15 +251,20 @@ def scrape_status(job_id: str):
 
 @router.get("/scrape-jobs")
 def scrape_jobs():
-    """Paused jobs that can be resumed - surfaced so the admin UI can offer
-    a 'Resume' button even after a page refresh or a backend restart, since
-    job state lives in the DB rather than in process memory."""
     return scrape_job_service.list_resumable_jobs()
 
 
 @router.post("/scrape-pause/{job_id}")
 def scrape_pause(job_id: str):
     job = scrape_job_service.request_pause(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@router.post("/scrape-cancel/{job_id}")
+def scrape_cancel(job_id: str):
+    job = scrape_job_service.request_cancel(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -268,33 +281,22 @@ def scrape_resume(job_id: str, background_tasks: BackgroundTasks):
 
 @router.get("/verification-status")
 def verification_status():
-    """Status of the background re-verification agent: whether it's mid-pass
-    right now, when its last pass finished, when the next one is scheduled
-    (2-day cooldown after each full pass), and a running tally for the
-    current pass."""
     return verification_agent.get_status()
 
 
 @router.post("/verification-run-now")
 def verification_run_now():
-    """Wakes the verification agent immediately instead of waiting out the
-    remainder of its 2-day cooldown. If a pass is already in progress this
-    just returns its current status."""
     verification_agent.run_once_now()
     return verification_agent.get_status()
 
 
 @router.post("/verification-pause")
 def verification_pause():
-    """Pauses the agent. If a pass is mid-run, it finishes whichever source
-    it's currently checking, then blocks before starting the next one."""
     verification_agent.pause()
     return verification_agent.get_status()
 
 
 @router.post("/verification-resume")
 def verification_resume():
-    """Resumes a paused agent - it continues the same pass from wherever it
-    left off."""
     verification_agent.resume()
     return verification_agent.get_status()

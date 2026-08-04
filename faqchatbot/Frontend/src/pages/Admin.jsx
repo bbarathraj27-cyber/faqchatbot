@@ -36,14 +36,19 @@ function Admin() {
   const [deepError, setDeepError] = useState(null);
   const [topicsModalPage, setTopicsModalPage] = useState(null);
 
+  const [selectedLanguages, setSelectedLanguages] = useState(new Set(["en"]));
+  const [filteredUrls, setFilteredUrls] = useState(null);
+  const [filteringUrls, setFilteringUrls] = useState(false);
+
   const [jobId, setJobId] = useState(null);
   const [jobStatus, setJobStatus] = useState(null);
   const pollRef = useRef(null);
   const [bulkPausing, setBulkPausing] = useState(false);
   const [bulkResuming, setBulkResuming] = useState(false);
+  const [bulkCancelling, setBulkCancelling] = useState(false);
+  const [confirmCancelJob, setConfirmCancelJob] = useState(false);
   const [resumableJobs, setResumableJobs] = useState([]);
 
-  // CHANGE 1: Added state
   const [verificationStatus, setVerificationStatus] = useState(null);
   const [pausing, setPausing] = useState(false);
   const [runningNow, setRunningNow] = useState(false);
@@ -72,7 +77,6 @@ function Admin() {
     }
   };
 
-  // CHANGE 2: Added fetch/trigger functions
   const fetchVerificationStatus = async () => {
     try {
       const response = await fetch(`${API_BASE_URL}/admin/verification-status`);
@@ -102,7 +106,6 @@ function Admin() {
     }
   };
 
-  // CHANGE 2b: Pause/Resume handlers for the self-healing agent
   const handlePauseVerification = async () => {
     setPausing(true);
     try {
@@ -127,7 +130,6 @@ function Admin() {
     }
   };
 
-  // CHANGE 3: Replaced existing useEffect
   useEffect(() => {
     fetchSources();
     fetchDbStats();
@@ -184,7 +186,7 @@ function Admin() {
         if (!response.ok) return;
         const data = await response.json();
         setJobStatus(data);
-        if (data.status === "completed" || data.status === "paused") {
+        if (data.status === "completed" || data.status === "paused" || data.status === "cancelled") {
           clearInterval(pollRef.current);
           fetchSources();
           fetchDbStats();
@@ -213,9 +215,6 @@ function Admin() {
     try {
       const response = await fetch(`${API_BASE_URL}/admin/scrape-pause/${jobId}`, { method: "POST" });
       if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
-      // The backend flips status -> "paused" only once the in-flight page
-      // finishes, so keep polling until that shows up rather than
-      // assuming it's paused immediately.
     } catch (err) {
       console.error("Pause request failed:", err);
     } finally {
@@ -239,6 +238,31 @@ function Admin() {
       console.error("Resume request failed:", err);
     } finally {
       setBulkResuming(false);
+    }
+  };
+
+  const handleCancelJob = async (id) => {
+    const targetId = id || jobId;
+    if (!targetId) return;
+    if (!confirmCancelJob) {
+      setConfirmCancelJob(true);
+      return;
+    }
+    setBulkCancelling(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/admin/scrape-cancel/${targetId}`, { method: "POST" });
+      if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+      const data = await response.json();
+      if (targetId === jobId) {
+        setJobStatus(data);
+        if (data.status !== "cancelled") pollJobStatus(targetId);
+      }
+      setResumableJobs((prev) => prev.filter((j) => j.job_id !== targetId));
+      setConfirmCancelJob(false);
+    } catch (err) {
+      console.error("Cancel request failed:", err);
+    } finally {
+      setBulkCancelling(false);
     }
   };
 
@@ -328,12 +352,58 @@ function Admin() {
       if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
       const data = await response.json();
       setAnalyzeResult(data);
+      const codes = (data.languages || []).map((l) => l.code);
+      setSelectedLanguages(new Set(codes.includes("en") ? ["en"] : codes));
+      setFilteredUrls(null);
     } catch (err) {
       setAnalyzeError("Couldn't analyze that site. Check the URL and try again.");
       console.error(err);
     } finally {
       setAnalyzing(false);
     }
+  };
+
+  useEffect(() => {
+    if (!analyzeResult?.all_urls || selectedLanguages.size === 0) {
+      if (analyzeResult?.all_urls) setFilteredUrls([]);
+      return;
+    }
+    let cancelled = false;
+    setFilteringUrls(true);
+    (async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/admin/filter-urls-by-language`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            urls: analyzeResult.all_urls,
+            languages: Array.from(selectedLanguages),
+          }),
+        });
+        if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+        const data = await response.json();
+        if (!cancelled) setFilteredUrls(data.urls);
+      } catch (err) {
+        console.error("Failed to filter URLs by language:", err);
+        if (!cancelled) setFilteredUrls([]);
+      } finally {
+        if (!cancelled) setFilteringUrls(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [analyzeResult, selectedLanguages]);
+
+  const toggleLanguage = (code) => {
+    setSelectedLanguages((prev) => {
+      const next = new Set(prev);
+      if (next.has(code)) next.delete(code);
+      else next.add(code);
+      return next;
+    });
+    setDeepResult(null);
   };
 
   const handleDeepAnalyze = async () => {
@@ -347,7 +417,7 @@ function Admin() {
       const response = await fetch(`${API_BASE_URL}/admin/analyze-site-deep`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: site }),
+        body: JSON.stringify({ url: site, urls: filteredUrls || [] }),
       });
       if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
       const data = await response.json();
@@ -361,12 +431,12 @@ function Admin() {
   };
 
   const handleStoreAll = async () => {
-    if (!analyzeResult?.all_urls) return;
+    if (!filteredUrls || filteredUrls.length === 0) return;
     try {
       const response = await fetch(`${API_BASE_URL}/admin/scrape-bulk-async`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ urls: analyzeResult.all_urls }),
+        body: JSON.stringify({ urls: filteredUrls }),
       });
       if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
       const data = await response.json();
@@ -383,6 +453,8 @@ function Admin() {
     setDeepResult(null);
     setJobId(null);
     setJobStatus(null);
+    setFilteredUrls(null);
+    setSelectedLanguages(new Set(["en"]));
     clearInterval(pollRef.current);
   };
 
@@ -497,10 +569,49 @@ function Admin() {
               ✅ {analyzeResult.total_pages} indexing page(s) found in {analyzeResult.domain}'s sitemap
             </p>
 
+            {analyzeResult.languages && analyzeResult.languages.length > 0 && (
+              <div className="bg-surface border border-border rounded-lg p-3">
+                <p className="text-[11px] uppercase tracking-wider text-muted font-mono mb-2">
+                  Languages found — tick which to scrape
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {analyzeResult.languages.map((lang) => {
+                    const checked = selectedLanguages.has(lang.code);
+                    return (
+                      <label
+                        key={lang.code}
+                        className={`flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border cursor-pointer transition ${
+                          checked
+                            ? "bg-accent/15 border-accent text-[#eef2f5]"
+                            : "bg-surface2 border-border text-muted hover:border-borderStrong"
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleLanguage(lang.code)}
+                          className="accent-accent"
+                        />
+                        {lang.name}
+                        <span className="text-[10px] opacity-70">({lang.count.toLocaleString()})</span>
+                      </label>
+                    );
+                  })}
+                </div>
+                <p className="text-[11px] text-muted mt-2">
+                  {filteringUrls
+                    ? "Filtering…"
+                    : filteredUrls !== null
+                    ? `${filteredUrls.length.toLocaleString()} page(s) match the selected language(s)`
+                    : ""}
+                </p>
+              </div>
+            )}
+
             {!deepResult && (
               <button
                 onClick={handleDeepAnalyze}
-                disabled={deepAnalyzing}
+                disabled={deepAnalyzing || filteringUrls || !filteredUrls || filteredUrls.length === 0}
                 className="text-xs bg-accent/90 text-[#0a0e12] font-semibold px-3 py-1.5 rounded-lg disabled:opacity-40 hover:-translate-y-0.5 transition self-start"
               >
                 {deepAnalyzing ? "Analyzing content…" : "Estimate word / chunk / storage size →"}
@@ -585,9 +696,11 @@ function Admin() {
                     </button>
                     <button
                       onClick={handleStoreAll}
-                      className="text-sm px-4 py-2 rounded-lg bg-accent text-[#0a0e12] font-semibold hover:-translate-y-0.5 transition"
+                      disabled={!filteredUrls || filteredUrls.length === 0}
+                      className="text-sm px-4 py-2 rounded-lg bg-accent text-[#0a0e12] font-semibold hover:-translate-y-0.5 transition disabled:opacity-40"
                     >
-                      Scrape & Store All {analyzeResult.total_pages} Pages
+                      Scrape & Store {(filteredUrls || []).length.toLocaleString()} Page(s)
+                      {selectedLanguages.size === 1 ? ` (${Array.from(selectedLanguages)[0]})` : ""}
                     </button>
                   </div>
                 )}
@@ -603,26 +716,55 @@ function Admin() {
                 {jobStatus.status === "completed" && "✅ Import complete"}
                 {jobStatus.status === "running" && "⏳ Importing in background…"}
                 {jobStatus.status === "paused" && "⏸️ Paused"}
+                {jobStatus.status === "cancelled" && "🛑 Cancelled"}
               </p>
               <div className="flex items-center gap-3">
                 <p className="text-xs text-muted">{jobStatus.pages_done} / {jobStatus.total_pages} pages</p>
                 {jobStatus.status === "running" && (
-                  <button
-                    onClick={handlePauseJob}
-                    disabled={bulkPausing}
-                    className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-edge/60 hover:border-accent2 transition disabled:opacity-40"
-                  >
-                    {bulkPausing ? "Pausing…" : "Pause"}
-                  </button>
+                  <>
+                    <button
+                      onClick={handlePauseJob}
+                      disabled={bulkPausing}
+                      className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-edge/60 hover:border-accent2 transition disabled:opacity-40"
+                    >
+                      {bulkPausing ? "Pausing…" : "Pause"}
+                    </button>
+                    <button
+                      onClick={() => handleCancelJob(jobId)}
+                      onBlur={() => setConfirmCancelJob(false)}
+                      disabled={bulkCancelling}
+                      className={`text-xs font-semibold px-3 py-1.5 rounded-lg border transition disabled:opacity-40 ${
+                        confirmCancelJob
+                          ? "bg-red-500 text-white border-red-500 hover:bg-red-600"
+                          : "text-red-400 border-red-500/30 hover:bg-red-500/10"
+                      }`}
+                    >
+                      {bulkCancelling ? "Cancelling…" : confirmCancelJob ? "Click again to confirm" : "Cancel"}
+                    </button>
+                  </>
                 )}
                 {jobStatus.status === "paused" && (
-                  <button
-                    onClick={() => handleResumeJob(jobId)}
-                    disabled={bulkResuming}
-                    className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-accent text-[#0a0e12] hover:-translate-y-0.5 transition disabled:opacity-40"
-                  >
-                    {bulkResuming ? "Resuming…" : "Resume"}
-                  </button>
+                  <>
+                    <button
+                      onClick={() => handleResumeJob(jobId)}
+                      disabled={bulkResuming}
+                      className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-accent text-[#0a0e12] hover:-translate-y-0.5 transition disabled:opacity-40"
+                    >
+                      {bulkResuming ? "Resuming…" : "Resume"}
+                    </button>
+                    <button
+                      onClick={() => handleCancelJob(jobId)}
+                      onBlur={() => setConfirmCancelJob(false)}
+                      disabled={bulkCancelling}
+                      className={`text-xs font-semibold px-3 py-1.5 rounded-lg border transition disabled:opacity-40 ${
+                        confirmCancelJob
+                          ? "bg-red-500 text-white border-red-500 hover:bg-red-600"
+                          : "text-red-400 border-red-500/30 hover:bg-red-500/10"
+                      }`}
+                    >
+                      {bulkCancelling ? "Cancelling…" : confirmCancelJob ? "Click again to confirm" : "Cancel"}
+                    </button>
+                  </>
                 )}
               </div>
             </div>
@@ -663,7 +805,12 @@ function Admin() {
                 continue from page {jobStatus.pages_done + 1}.
               </p>
             )}
-            {jobStatus.status === "completed" && (
+            {jobStatus.status === "cancelled" && (
+              <p className="text-xs text-muted">
+                Cancelled — {jobStatus.pages_done} page(s) already scraped are kept; the rest were dropped.
+              </p>
+            )}
+            {(jobStatus.status === "completed" || jobStatus.status === "cancelled") && (
               <button onClick={handleResetAnalysis} className="text-xs text-edge hover:underline self-start mt-1">
                 Start a new analysis
               </button>
@@ -680,20 +827,33 @@ function Admin() {
                   {j.pages_done} / {j.total_pages} pages done
                   {j.error ? ` — ${j.error}` : ""}
                 </span>
-                <button
-                  onClick={() => handleResumeJob(j.job_id)}
-                  disabled={bulkResuming}
-                  className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-accent text-[#0a0e12] hover:-translate-y-0.5 transition disabled:opacity-40"
-                >
-                  {bulkResuming ? "Resuming…" : "Resume"}
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => handleResumeJob(j.job_id)}
+                    disabled={bulkResuming}
+                    className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-accent text-[#0a0e12] hover:-translate-y-0.5 transition disabled:opacity-40"
+                  >
+                    {bulkResuming ? "Resuming…" : "Resume"}
+                  </button>
+                  <button
+                    onClick={() => handleCancelJob(j.job_id)}
+                    onBlur={() => setConfirmCancelJob(false)}
+                    disabled={bulkCancelling}
+                    className={`text-xs font-semibold px-3 py-1.5 rounded-lg border transition disabled:opacity-40 ${
+                      confirmCancelJob
+                        ? "bg-red-500 text-white border-red-500 hover:bg-red-600"
+                        : "text-red-400 border-red-500/30 hover:bg-red-500/10"
+                    }`}
+                  >
+                    {bulkCancelling ? "Cancelling…" : confirmCancelJob ? "Confirm" : "Cancel"}
+                  </button>
+                </div>
               </div>
             ))}
           </div>
         )}
       </div>
 
-      {/* CHANGE 4: Added verification status card, now with Pause/Resume */}
       {verificationStatus && (
         <div className="mb-6 rounded-xl border border-edge/40 bg-panel/40 p-4">
           <div className="flex items-center justify-between flex-wrap gap-2">

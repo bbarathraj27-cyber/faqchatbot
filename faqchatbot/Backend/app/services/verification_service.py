@@ -25,6 +25,7 @@ import logging
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import ObjectDeletedError, StaleDataError
 
 from app.models.source_model import Source
 from app.services.scraper_service import scrape_faq_page
@@ -81,15 +82,43 @@ def _rescrape_and_chunk(url: str) -> list[Chunk]:
     return chunks
 
 
+def _safe_commit(db: Session, url: str) -> bool:
+    """
+    Commits the session, tolerating the case where the Source row was
+    deleted out from under us (e.g. someone hit "Delete" in the admin UI
+    while this check was mid-flight).
+
+    On StaleDataError / ObjectDeletedError: rolls back so the session is
+    usable again for the *next* source in the pass, and returns False.
+    On success: returns True.
+
+    Without this, a single deleted-while-checking source poisons the
+    SQLAlchemy session (PendingRollbackError) for every source checked
+    after it in the same pass, and even logging the failure can itself
+    throw (touching an expired attribute like source.url triggers a
+    reload against a session that's no longer usable).
+    """
+    try:
+        db.commit()
+        return True
+    except (StaleDataError, ObjectDeletedError) as e:
+        db.rollback()
+        logger.warning(f"[verify] {url} was deleted or modified concurrently, skipping: {e}")
+        return False
+
+
 def verify_source(source: Source, db: Session, similarity_threshold: float = SIMILARITY_THRESHOLD) -> dict:
     """
     Checks one Source against its live webpage and corrects it in place if
-    the stored content has drifted. Always commits an updated
+    the stored content has drifted. Always attempts to commit an updated
     last_checked_at / last_check_result / last_similarity_score on the
     Source row, even on failure, so the admin UI reflects reality.
 
     Returns a small result dict for the caller (agent loop) to aggregate.
     """
+    # Capture the URL up front, before any commit/rollback can expire this
+    # attribute — touching source.url *after* a failed commit is what
+    # previously triggered the cascading PendingRollbackError.
     url = source.url
     now = datetime.now(timezone.utc)
 
@@ -99,7 +128,8 @@ def verify_source(source: Source, db: Session, similarity_threshold: float = SIM
         logger.warning(f"[verify] Could not re-scrape {url}: {e}")
         source.last_checked_at = now
         source.last_check_result = "error"
-        db.commit()
+        if not _safe_commit(db, url):
+            return {"url": url, "result": "skipped", "detail": "source deleted during re-scrape"}
         return {"url": url, "result": "error", "detail": str(e)}
 
     stored_chunks = get_chunks_by_source(url)
@@ -116,13 +146,15 @@ def verify_source(source: Source, db: Session, similarity_threshold: float = SIM
         # an empty page, etc). Don't nuke existing good data over a
         # transient fetch problem — just flag it for a human to look at.
         source.last_check_result = "error"
-        db.commit()
+        if not _safe_commit(db, url):
+            return {"url": url, "result": "skipped", "detail": "source deleted before commit"}
         logger.warning(f"[verify] {url} returned no scrapable content on re-check")
         return {"url": url, "result": "error", "detail": "no content on re-scrape"}
 
     if similarity >= similarity_threshold:
         source.last_check_result = "match"
-        db.commit()
+        if not _safe_commit(db, url):
+            return {"url": url, "result": "skipped", "detail": "source deleted before commit"}
         return {"url": url, "result": "match", "similarity": similarity}
 
     # --- Drift detected: correct it ---
@@ -155,7 +187,13 @@ def verify_source(source: Source, db: Session, similarity_threshold: float = SIM
         source.last_check_result = "corrected"
         source.last_corrected_at = now
         source.correction_count = (source.correction_count or 0) + 1
-        db.commit()
+
+        if not _safe_commit(db, url):
+            return {
+                "url": url,
+                "result": "skipped",
+                "detail": "source deleted during correction (new vectors were still written)",
+            }
 
         logger.info(
             f"[verify] Corrected {url}: removed {deleted} stale vectors, "
@@ -171,5 +209,6 @@ def verify_source(source: Source, db: Session, similarity_threshold: float = SIM
     except Exception as e:
         logger.error(f"[verify] Failed to correct {url}: {e}")
         source.last_check_result = "error"
-        db.commit()
+        if not _safe_commit(db, url):
+            return {"url": url, "result": "skipped", "detail": "source deleted during failed correction"}
         return {"url": url, "result": "error", "detail": str(e)}

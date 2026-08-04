@@ -4,6 +4,7 @@ from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree
 from bs4 import BeautifulSoup
 from app.services.neo4j_service import extract_topics
+from app.services.language_detection import group_urls_by_language
 
 WORDS_PER_CHUNK_ESTIMATE = 225
 BYTES_PER_CHUNK_ESTIMATE = 10 * 1024
@@ -44,7 +45,7 @@ def analyze_site(base_url: str) -> dict:
     except Exception as e:
         return {
             "domain": domain, "sitemap_found": False, "error": str(e),
-            "total_pages": 0, "sample_urls": [], "all_urls": [],
+            "total_pages": 0, "sample_urls": [], "all_urls": [], "languages": [],
         }
 
     same_domain_urls = sorted(set(u for u in all_urls if urlparse(u).netloc == parsed.netloc))
@@ -53,6 +54,7 @@ def analyze_site(base_url: str) -> dict:
         "total_pages": len(same_domain_urls),
         "sample_urls": same_domain_urls[:20],
         "all_urls": same_domain_urls,
+        "languages": group_urls_by_language(same_domain_urls),
     }
 
 
@@ -68,13 +70,21 @@ def _fetch_page_text(url: str) -> str:
         return ""
 
 
-def analyze_site_deep(base_url: str, sample_size: int = 25) -> dict:
+def analyze_site_deep(base_url: str, sample_size: int = 25, urls_override: list[str] | None = None) -> dict:
     basic = analyze_site(base_url)
     if not basic["sitemap_found"]:
         return basic
 
-    all_urls = basic["all_urls"]
+    all_urls = urls_override if urls_override is not None else basic["all_urls"]
     total_pages = len(all_urls)
+
+    if total_pages == 0:
+        return {
+            "domain": basic["domain"], "sitemap_found": True,
+            "total_pages_in_sitemap": 0,
+            "error": "No pages match the selected language(s)",
+        }
+
     sample = random.sample(all_urls, min(sample_size, total_pages))
 
     total_words_in_sample = 0
