@@ -180,6 +180,13 @@ function Admin() {
   const firstUrl = () => urls.split("\n").map((u) => u.trim()).filter(Boolean)[0] || "";
 
   const pollJobStatus = (id) => {
+    // Without this, every call (start / resume / cancel-then-still-running)
+    // stacks a NEW interval on top of any still-running one instead of
+    // replacing it, since pollRef.current was being overwritten without
+    // clearing the old timer first. That leads to duplicate overlapping
+    // status fetches and, worse, duplicate calls to fetchSources/fetchDbStats
+    // once the job finishes.
+    clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
       try {
         const response = await fetch(`${API_BASE_URL}/admin/scrape-status/${id}`);

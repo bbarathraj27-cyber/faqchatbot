@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Float, func
+from sqlalchemy import Column, Integer, String, DateTime, Float, Boolean, func
 
 from app.database import Base
 
@@ -25,3 +25,9 @@ class Source(Base):
     last_similarity_score = Column(Float, nullable=True)
     # How many times the agent has re-corrected this source over its life.
     correction_count = Column(Integer, default=0)
+
+    # Set once backfill_topics.py has run Neo4j topic extraction for this
+    # source. Bulk ingestion (admin_api.py) runs with extract_topics=False,
+    # so every source starts out False here and gets picked up later at a
+    # throttled rate that respects Groq's daily token quota.
+    topics_backfilled = Column(Boolean, default=False)

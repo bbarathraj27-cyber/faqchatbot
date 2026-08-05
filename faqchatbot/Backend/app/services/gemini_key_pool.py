@@ -221,6 +221,11 @@ def chat_completion(
     last_exc: Exception | None = None
 
     while time.time() < end_time:
+        # Same reasoning as groq_key_pool.chat_completion: check before every
+        # attempt so pause/cancel isn't silently absorbed by this retry loop
+        # while it's the Groq-exhausted fallback path.
+        control_signal.raise_if_abort_requested()
+
         client, label = gemini_key_pool.get_client()
         if client is None:
             break

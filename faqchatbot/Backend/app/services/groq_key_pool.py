@@ -234,6 +234,14 @@ def chat_completion(
         end_time = deadline if deadline is not None else time.time() + CHAT_RETRY_BUDGET_SECONDS
 
         while time.time() < end_time:
+            # Checked before every attempt (mirrors embedding_service's
+            # _embed_one_batch) so a pause/cancel doesn't have to wait for
+            # this whole retry budget to expire before it's noticed - without
+            # this, a topic-extraction call stuck rotating across
+            # rate-limited keys can silently eat the pause click for as long
+            # as the retry budget allows.
+            control_signal.raise_if_abort_requested()
+
             client, label = groq_key_pool.get_client()
             if client is None:
                 break

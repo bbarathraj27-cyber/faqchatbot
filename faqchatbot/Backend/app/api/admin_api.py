@@ -1,4 +1,5 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
@@ -17,6 +18,12 @@ from app.services.verification_service import verify_source
 from app.services import scrape_job_service, control_signal
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+# How many URLs to have in flight at once during bulk ingestion.
+# 10 is a moderate default that's fast without hammering Groq/Pinecone rate
+# limits too hard. Tune down (5) if you see rate-limit errors, up (20+) if
+# your API tiers can absorb it.
+BULK_SCRAPE_CONCURRENCY = 10
 
 
 class ScrapeRequest(BaseModel):
@@ -201,80 +208,158 @@ def _run_bulk_scrape(job_id: str, is_resume: bool = False):
                 return
 
         i = job.current_index
-        while i < len(urls):
-            # Fast, in-memory, DB-independent check FIRST - this is what
-            # makes Pause/Cancel take effect almost instantly instead of
-            # waiting on a DB round-trip (or hanging if Neon is down).
-            sig = control_signal.get_signal(job_id)
 
-            if sig["cancel"]:
-                job.status = "cancelled"
-                job.pause_requested = False
-                job.cancel_requested = False
-                job.current_url = None
-                _safe_commit(db, job_id)
-                return
-
-            if sig["pause"]:
-                job.status = "paused"
-                job.pause_requested = False
-                job.current_url = None
-                _safe_commit(db, job_id)
-                return
-
-            url = urls[i]
-            job.current_url = url
-            _safe_commit(db, job_id)
-
+        def _scrape_one(url: str):
+            # Runs in a worker thread. Never raises -- exceptions are
+            # captured and returned so the main thread does all DB writes
+            # (SQLAlchemy sessions aren't thread-safe to share across threads).
+            #
+            # control_signal's abort-check plumbing (used by the Gemini/Groq
+            # key-pool cooldown waits) is keyed off THREAD-LOCAL storage,
+            # under the original assumption that one job = one thread
+            # start-to-finish. With a thread pool, each task can land on a
+            # different worker thread, so job_id must be (re)associated with
+            # whichever thread actually runs this call -- otherwise
+            # interruptible_sleep()/raise_if_abort_requested() silently see
+            # no job_id and pause/cancel stops interrupting in-flight key
+            # cooldowns.
+            control_signal.set_current_job(job_id)
             try:
-                result = ingest_website(urls=[url], question_selector=question_selector, answer_selector=answer_selector)
-                source = db.query(Source).filter(Source.url == url).first()
-                if not source:
-                    source = Source(url=url)
-                    db.add(source)
-                source.status = result["status"]
-                source.chunks_created = result["chunks_created"]
-                total_chunks += result["chunks_created"]
-                total_words += result.get("total_words", 0)
-                consecutive_errors = 0
-                i += 1
-                job.current_index = i
-                job.chunks_created = total_chunks
-                job.total_words = total_words
-                job.consecutive_errors = 0
-                _safe_commit(db, job_id)
+                result = ingest_website(
+                    urls=[url],
+                    question_selector=question_selector,
+                    answer_selector=answer_selector,
+                    # extract_topics=False: bulk ingestion must never depend on
+                    # the Groq topic-extraction call. With ~18.8k URLs, leaving
+                    # this on burns through all Groq keys' daily token quota
+                    # (200k TPD each) within a small fraction of the run, after
+                    # which every remaining page just cycles through
+                    # rate-limit retries/cooldowns doing no real ingestion
+                    # work. Topics are backfilled separately
+                    # (see backfill_topics.py) at a sustainable rate after
+                    # content is in.
+                    extract_topics=False,
+                )
+                return url, result, None
             except control_signal.AbortRequested:
-                # Pause/cancel fired WHILE this page was mid-embedding (or
-                # mid rate-limit-retry) - this is not a scrape failure, so
-                # don't touch consecutive_errors or job.current_index. The
-                # page will simply be re-attempted from scratch next time
-                # this job runs (fresh start or resume), since i was never
-                # incremented. Fall through to the top of the loop, which
-                # will see the same pause/cancel signal and handle it there
-                # (single place that sets job.status, avoids duplicating
-                # that logic here).
-                db.rollback()
-                continue
+                # Pause/cancel fired mid-call. Not a real failure -- signal it
+                # distinctly so the batch-apply loop below leaves
+                # job.current_index untouched for this (and any later) URL in
+                # the batch, exactly like the old sequential loop's behavior.
+                return url, None, "ABORTED"
             except Exception as e:
-                db.rollback()
-                consecutive_errors += 1
-                err_msg = f"Failed on {url}: {e}"
-                logger.warning(err_msg)
-                job.last_error = err_msg
-                job.consecutive_errors = consecutive_errors
-                job.chunks_created = total_chunks
-                job.total_words = total_words
-                if consecutive_errors >= scrape_job_service.AUTO_PAUSE_AFTER_CONSECUTIVE_ERRORS:
+                return url, None, e
+            finally:
+                # Don't leak this job_id association to whatever unrelated
+                # task the pool runs on this thread next.
+                control_signal.set_current_job(None)
+
+        with ThreadPoolExecutor(max_workers=BULK_SCRAPE_CONCURRENCY) as executor:
+            while i < len(urls):
+                # Fast, in-memory, DB-independent check FIRST - this is what
+                # makes Pause/Cancel take effect almost instantly instead of
+                # waiting on a DB round-trip (or hanging if Neon is down).
+                sig = control_signal.get_signal(job_id)
+
+                if sig["cancel"]:
+                    job.status = "cancelled"
+                    job.pause_requested = False
+                    job.cancel_requested = False
+                    job.current_url = None
+                    _safe_commit(db, job_id)
+                    return
+
+                if sig["pause"]:
                     job.status = "paused"
                     job.pause_requested = False
                     job.current_url = None
-                    job.last_error = (
-                        f"Auto-paused after {consecutive_errors} consecutive failures "
-                        f"(likely an API key or network issue) - {err_msg}"
-                    )
                     _safe_commit(db, job_id)
                     return
+
+                # Dispatch the next batch (sliding window) concurrently.
+                batch_urls = urls[i:i + BULK_SCRAPE_CONCURRENCY]
+                job.current_url = (
+                    f"{batch_urls[0]} (+{len(batch_urls) - 1} more in flight)"
+                    if len(batch_urls) > 1 else batch_urls[0]
+                )
                 _safe_commit(db, job_id)
+
+                futures = {executor.submit(_scrape_one, u): idx for idx, u in enumerate(batch_urls)}
+                results_by_index = {}
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    results_by_index[idx] = future.result()
+
+                # Apply results back in original URL order so job.current_index
+                # still means "everything before this index is done", and so
+                # consecutive_errors / auto-pause behave the same as the old
+                # sequential loop regardless of which URL happened to finish
+                # first in the thread pool.
+                pause_or_cancel_mid_batch = False
+                for idx in range(len(batch_urls)):
+                    url, result, error = results_by_index[idx]
+
+                    if error == "ABORTED":
+                        # Pause/cancel was mid-flight for this URL. Stop
+                        # applying the rest of this batch's results -- i is
+                        # left exactly where it is, so this URL (and any
+                        # after it in the batch) get re-attempted from
+                        # scratch on the next run/resume, matching the old
+                        # sequential loop's AbortRequested handling.
+                        db.rollback()
+                        pause_or_cancel_mid_batch = True
+                        break
+
+                    if error is not None:
+                        db.rollback()
+                        consecutive_errors += 1
+                        err_msg = f"Failed on {url}: {error}"
+                        logger.warning(err_msg)
+                        job.last_error = err_msg
+                        job.consecutive_errors = consecutive_errors
+                        job.chunks_created = total_chunks
+                        job.total_words = total_words
+                        if consecutive_errors >= scrape_job_service.AUTO_PAUSE_AFTER_CONSECUTIVE_ERRORS:
+                            job.status = "paused"
+                            job.pause_requested = False
+                            job.current_url = None
+                            job.last_error = (
+                                f"Auto-paused after {consecutive_errors} consecutive failures "
+                                f"(likely an API key or network issue) - {err_msg}"
+                            )
+                            _safe_commit(db, job_id)
+                            return
+                        i += 1
+                        job.current_index = i
+                        _safe_commit(db, job_id)
+                        continue
+
+                    source = db.query(Source).filter(Source.url == url).first()
+                    if not source:
+                        source = Source(url=url)
+                        db.add(source)
+                    source.status = result["status"]
+                    source.chunks_created = result["chunks_created"]
+                    total_chunks += result["chunks_created"]
+                    total_words += result.get("total_words", 0)
+                    consecutive_errors = 0
+                    i += 1
+                    job.current_index = i
+                    job.chunks_created = total_chunks
+                    job.total_words = total_words
+                    job.consecutive_errors = 0
+                    _safe_commit(db, job_id)
+
+                    # Re-check signals between URLs within the batch too, so a
+                    # pause/cancel doesn't wait for the whole in-flight
+                    # batch's bookkeeping to finish before being honored.
+                    sig = control_signal.get_signal(job_id)
+                    if sig["cancel"] or sig["pause"]:
+                        pause_or_cancel_mid_batch = True
+                        break
+
+                if pause_or_cancel_mid_batch:
+                    continue  # top of while loop will see the signal and exit cleanly
 
         job.status = "completed"
         job.current_url = None

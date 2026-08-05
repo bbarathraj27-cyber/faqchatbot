@@ -4,6 +4,7 @@ from neo4j import GraphDatabase
 from app.config import settings
 from app.prompts.topic_prompt import build_topic_extraction_prompt, build_batch_topic_extraction_prompt
 from app.services.groq_key_pool import chat_completion
+from app.services.control_signal import AbortRequested
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,11 @@ def extract_topics(text: str, deadline: float | None = None) -> list[str]:
         raw = chat_completion(messages, model=settings.LLM_MODEL, temperature=0.0, deadline=deadline)
         topics = [t.strip().lower() for t in raw.split(",") if t.strip()]
         return topics[:4]
+    except AbortRequested:
+        # Must NOT be swallowed like a normal extraction failure - this is
+        # pause/cancel firing mid-call. Let it propagate so the bulk-scrape
+        # loop notices immediately instead of the job silently continuing.
+        raise
     except Exception as e:
         logger.warning(f"Could not extract topics: {e}")
         return []
@@ -203,6 +209,11 @@ def extract_topics_batch(texts: list[str]) -> list[list[str]]:
             else:
                 result.append([])
         return result
+    except AbortRequested:
+        # Same as extract_topics: this is pause/cancel, not a malformed
+        # response - re-raise instead of falling back to a per-chunk retry
+        # loop that would just burn more time ignoring the same signal.
+        raise
     except Exception as e:
         logger.warning(f"Batch topic extraction failed ({e}), falling back to per-chunk extraction")
         return [extract_topics(t) for t in texts]

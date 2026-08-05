@@ -186,70 +186,99 @@ class VerificationAgent:
                     break
 
     def _run_full_pass(self):
+        # Only used to pull the initial source list. Deliberately NOT kept
+        # open for the whole pass - see the per-source session below.
         db = SessionLocal()
         try:
-            sources = db.query(Source).order_by(Source.id.asc()).all()
-            total = len(sources)
-            started_at = datetime.now(timezone.utc)
-
-            with self._lock:
-                self._status.update({
-                    "running_pass": True,
-                    "last_pass_started_at": started_at.isoformat(),
-                    "sources_checked": 0,
-                    "sources_total": total,
-                    "corrected_this_pass": 0,
-                    "errors_this_pass": 0,
-                    "current_url": None,
-                })
-
-            logger.info(f"Verification agent starting full pass over {total} source(s)")
-
-            corrected = 0
-            errors = 0
-            for i, source in enumerate(sources):
-                # Blocks here (no timeout) if pause() was called, until
-                # resume() sets the event again. Checked BEFORE starting
-                # the next source, never mid-verify_source(), so a paused
-                # agent never leaves a source half-corrected.
-                self._pause_event.wait()
-
-                with self._lock:
-                    self._status["current_url"] = source.url
-
-                try:
-                    result = verify_source(source, db)
-                    if result["result"] == "corrected":
-                        corrected += 1
-                    elif result["result"] == "error":
-                        errors += 1
-                except Exception as e:
-                    logger.error(f"[verify] Unhandled error checking {source.url}: {e}")
-                    errors += 1
-                    db.rollback()
-
-                with self._lock:
-                    self._status["sources_checked"] = i + 1
-                    self._status["corrected_this_pass"] = corrected
-                    self._status["errors_this_pass"] = errors
-
-                time.sleep(PER_SOURCE_PAUSE_SECONDS)
-
-            finished_at = datetime.now(timezone.utc)
-            summary = (
-                f"Checked {total} source(s): {corrected} corrected, "
-                f"{errors} error(s), {total - corrected - errors} already up to date."
-            )
-            with self._lock:
-                self._status.update({
-                    "running_pass": False,
-                    "last_pass_finished_at": finished_at.isoformat(),
-                    "current_url": None,
-                    "last_pass_summary": summary,
-                })
-            logger.info(f"Verification agent finished pass: {summary}")
+            # Only source IDs are needed to drive the loop - the actual
+            # Source row is re-fetched fresh (in its own short-lived
+            # session) right before each verify_source() call below.
+            source_ids = [row[0] for row in db.query(Source.id).order_by(Source.id.asc()).all()]
         finally:
             db.close()
+
+        total = len(source_ids)
+        started_at = datetime.now(timezone.utc)
+
+        with self._lock:
+            self._status.update({
+                "running_pass": True,
+                "last_pass_started_at": started_at.isoformat(),
+                "sources_checked": 0,
+                "sources_total": total,
+                "corrected_this_pass": 0,
+                "errors_this_pass": 0,
+                "current_url": None,
+            })
+
+        logger.info(f"Verification agent starting full pass over {total} source(s)")
+
+        corrected = 0
+        errors = 0
+        for i, source_id in enumerate(source_ids):
+            # Blocks here (no timeout) if pause() was called, until
+            # resume() sets the event again. Checked BEFORE starting
+            # the next source, never mid-verify_source(), so a paused
+            # agent never leaves a source half-corrected.
+            self._pause_event.wait()
+
+            # A fresh session per source, opened and closed right around
+            # the single verify_source() call. Deliberately NOT one session
+            # held for the whole (potentially hours-long, 230+ source)
+            # pass: Neon/Postgres drops idle connections, and a session
+            # checked out for the entire pass never returns to the pool
+            # between sources, so pool_pre_ping never gets a chance to
+            # catch and replace a connection that died in between. Short-
+            # lived sessions keep each connection's lifetime well inside
+            # any idle timeout and let pre-ping do its job on every source.
+            db = SessionLocal()
+            url = None
+            try:
+                source = db.get(Source, source_id)
+                if source is None:
+                    # Deleted between listing IDs and getting here.
+                    continue
+                url = source.url
+
+                with self._lock:
+                    self._status["current_url"] = url
+
+                result = verify_source(source, db)
+                if result["result"] == "corrected":
+                    corrected += 1
+                elif result["result"] == "error":
+                    errors += 1
+            except Exception as e:
+                # `url` was captured (if we got that far) before anything
+                # that could have broken the session, so logging it here
+                # never risks touching an expired/detached ORM attribute
+                # against a dead connection - that's what previously
+                # turned a single transient error into a whole-pass crash.
+                logger.error(f"[verify] Unhandled error checking {url or f'source id={source_id}'}: {e}")
+                errors += 1
+            finally:
+                db.close()
+
+            with self._lock:
+                self._status["sources_checked"] = i + 1
+                self._status["corrected_this_pass"] = corrected
+                self._status["errors_this_pass"] = errors
+
+            time.sleep(PER_SOURCE_PAUSE_SECONDS)
+
+        finished_at = datetime.now(timezone.utc)
+        summary = (
+            f"Checked {total} source(s): {corrected} corrected, "
+            f"{errors} error(s), {total - corrected - errors} already up to date."
+        )
+        with self._lock:
+            self._status.update({
+                "running_pass": False,
+                "last_pass_finished_at": finished_at.isoformat(),
+                "current_url": None,
+                "last_pass_summary": summary,
+            })
+        logger.info(f"Verification agent finished pass: {summary}")
 
 
 verification_agent = VerificationAgent()

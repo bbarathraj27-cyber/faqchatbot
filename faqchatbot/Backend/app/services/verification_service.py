@@ -24,6 +24,7 @@ import difflib
 import logging
 from datetime import datetime, timezone
 
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import ObjectDeletedError, StaleDataError
 
@@ -90,13 +91,19 @@ def _safe_commit(db: Session, url: str) -> bool:
 
     On StaleDataError / ObjectDeletedError: rolls back so the session is
     usable again for the *next* source in the pass, and returns False.
+    On OperationalError (e.g. "SSL connection has been closed unexpectedly"
+    - Neon/Postgres dropping an idle or long-lived connection mid-pass):
+    same treatment - rolls back (which discards the dead DBAPI connection;
+    the next checkout gets a fresh one thanks to pool_pre_ping) and returns
+    False, instead of letting a transient network blip propagate.
     On success: returns True.
 
-    Without this, a single deleted-while-checking source poisons the
-    SQLAlchemy session (PendingRollbackError) for every source checked
-    after it in the same pass, and even logging the failure can itself
-    throw (touching an expired attribute like source.url triggers a
-    reload against a session that's no longer usable).
+    Without this, a single deleted-while-checking (or disconnected-while-
+    checking) source poisons the SQLAlchemy session (PendingRollbackError)
+    for every source checked after it in the same pass, and even logging
+    the failure can itself throw (touching an expired attribute like
+    source.url triggers a reload against a session that's no longer
+    usable).
     """
     try:
         db.commit()
@@ -104,6 +111,10 @@ def _safe_commit(db: Session, url: str) -> bool:
     except (StaleDataError, ObjectDeletedError) as e:
         db.rollback()
         logger.warning(f"[verify] {url} was deleted or modified concurrently, skipping: {e}")
+        return False
+    except OperationalError as e:
+        db.rollback()
+        logger.warning(f"[verify] {url}: DB connection dropped during commit (will retry next pass): {e}")
         return False
 
 
