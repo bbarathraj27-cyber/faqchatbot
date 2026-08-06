@@ -25,6 +25,9 @@ function Admin() {
   const [deletingId, setDeletingId] = useState(null);
   const [deletingAll, setDeletingAll] = useState(false);
   const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
+  const [selectedSourceIds, setSelectedSourceIds] = useState(new Set());
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
 
   const [dbStats, setDbStats] = useState(null);
 
@@ -39,6 +42,21 @@ function Admin() {
   const [selectedLanguages, setSelectedLanguages] = useState(new Set(["en"]));
   const [filteredUrls, setFilteredUrls] = useState(null);
   const [filteringUrls, setFilteringUrls] = useState(false);
+
+  // Range tab: "1-200", "201-400", etc. Also accepts a plain number (legacy
+  // shorthand for "1-N"). rangeAnalysis holds the language breakdown + how
+  // many of those pages are already ingested, scoped to just that slice.
+  const [rangeAnalysis, setRangeAnalysis] = useState(null);
+  const [rangeAnalyzing, setRangeAnalyzing] = useState(false);
+  const [rangeAnalyzeError, setRangeAnalyzeError] = useState(null);
+  const [rangeSelectedLanguages, setRangeSelectedLanguages] = useState(new Set(["en"]));
+
+  // Single-scrape path: pasted URL(s), no range. Language breakdown of
+  // exactly the pasted links (URL-pattern based, no sitemap fetch), so a
+  // checklist shows up right under the textarea the moment URLs are typed.
+  const [pastedLanguages, setPastedLanguages] = useState(null);
+  const [pastedAnalyzing, setPastedAnalyzing] = useState(false);
+  const [pastedSelectedLanguages, setPastedSelectedLanguages] = useState(new Set(["en"]));
 
   const [jobId, setJobId] = useState(null);
   const [jobStatus, setJobStatus] = useState(null);
@@ -151,6 +169,12 @@ function Admin() {
     try {
       const response = await fetch(`${API_BASE_URL}/sources/${sourceId}`, { method: "DELETE" });
       if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+      setSelectedSourceIds((prev) => {
+        if (!prev.has(sourceId)) return prev;
+        const next = new Set(prev);
+        next.delete(sourceId);
+        return next;
+      });
       await fetchSources();
       await fetchDbStats();
     } catch (err) {
@@ -172,6 +196,7 @@ function Admin() {
       await fetchSources();
       await fetchDbStats();
       setConfirmDeleteAll(false);
+      setSelectedSourceIds(new Set());
     } catch (err) {
       console.error("Delete all failed:", err);
     } finally {
@@ -179,7 +204,70 @@ function Admin() {
     }
   };
 
+  const toggleSourceSelected = (id) => {
+    setSelectedSourceIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAllSources = () => {
+    setSelectedSourceIds((prev) =>
+      prev.size === sources.length ? new Set() : new Set(sources.map((s) => s.id))
+    );
+  };
+
+  const handleBulkDelete = async () => {
+    if (selectedSourceIds.size === 0) return;
+    if (!confirmBulkDelete) {
+      setConfirmBulkDelete(true);
+      return;
+    }
+    setBulkDeleting(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/sources/delete-bulk`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: Array.from(selectedSourceIds) }),
+      });
+      if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+      setSelectedSourceIds(new Set());
+      setConfirmBulkDelete(false);
+      await fetchSources();
+      await fetchDbStats();
+    } catch (err) {
+      console.error("Bulk delete failed:", err);
+    } finally {
+      setBulkDeleting(false);
+    }
+  };
+
   const firstUrl = () => urls.split("\n").map((u) => u.trim()).filter(Boolean)[0] || "";
+
+  // Accepts "1-200", "201-400", "1 - 200", or a plain number ("200", treated
+  // as legacy shorthand for "1-200"). Returns { start, end } (1-indexed,
+  // inclusive) or null if the field doesn't parse yet.
+  const parseRange = (value) => {
+    const trimmed = (value || "").trim();
+    if (!trimmed) return null;
+
+    const pairMatch = trimmed.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (pairMatch) {
+      const start = parseInt(pairMatch[1], 10);
+      const end = parseInt(pairMatch[2], 10);
+      if (start > 0 && end >= start) return { start, end };
+      return null;
+    }
+
+    const singleMatch = trimmed.match(/^(\d+)$/);
+    if (singleMatch) {
+      const end = parseInt(singleMatch[1], 10);
+      if (end > 0) return { start: 1, end };
+    }
+    return null;
+  };
 
   const pollJobStatus = (id) => {
     // Without this, every call (start / resume / cancel-then-still-running)
@@ -282,9 +370,9 @@ function Admin() {
     setJobId(null);
     setJobStatus(null);
 
-    const rangeNum = parseInt(range, 10);
+    const parsedRange = parseRange(range);
 
-    if (rangeNum && rangeNum > 0) {
+    if (parsedRange) {
       const site = firstUrl();
       if (!site) return;
 
@@ -295,9 +383,18 @@ function Admin() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             url: site,
-            limit: rangeNum,
+            start: parsedRange.start,
+            end: parsedRange.end,
             question_selector: questionSelector || null,
             answer_selector: answerSelector || null,
+            // Only send a language filter once we actually know what
+            // languages are in this range (rangeAnalysis loaded) - avoids
+            // accidentally restricting to the stale default ["en"] before
+            // the checklist has had a chance to load/be adjusted.
+            languages:
+              rangeAnalysis && rangeAnalysis.languages.length > 0
+                ? Array.from(rangeSelectedLanguages)
+                : null,
           }),
         });
         if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
@@ -312,8 +409,30 @@ function Admin() {
         setLoading(false);
       }
     } else {
-      const urlList = urls.split("\n").map((u) => u.trim()).filter(Boolean);
+      let urlList = urls.split("\n").map((u) => u.trim()).filter(Boolean);
       if (urlList.length === 0) return;
+
+      // Apply the pasted-URL language checklist (if it loaded in time and
+      // the user unchecked something) before sending the final list off.
+      if (pastedLanguages && pastedLanguages.length > 0 && pastedSelectedLanguages.size < pastedLanguages.length) {
+        try {
+          const filterResponse = await fetch(`${API_BASE_URL}/admin/filter-urls-by-language`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ urls: urlList, languages: Array.from(pastedSelectedLanguages) }),
+          });
+          if (filterResponse.ok) {
+            const filterData = await filterResponse.json();
+            urlList = filterData.urls;
+          }
+        } catch (err) {
+          console.error("Language filter failed, scraping unfiltered list:", err);
+        }
+        if (urlList.length === 0) {
+          setError("No pasted URL(s) match the selected language(s).");
+          return;
+        }
+      }
 
       setLoading(true);
       try {
@@ -415,6 +534,118 @@ function Admin() {
     setDeepResult(null);
   };
 
+  // Debounced: whenever the range field (or the URL) changes, ask the
+  // backend what languages appear in that specific page slice, and how
+  // many of those pages are already ingested - so entering "201-400" right
+  // after "1-200" shows a fresh checklist scoped to just the new batch.
+  useEffect(() => {
+    const parsed = parseRange(range);
+    const site = firstUrl();
+    if (!parsed || !site) {
+      setRangeAnalysis(null);
+      setRangeAnalyzeError(null);
+      setRangeAnalyzing(false);
+      return;
+    }
+
+    let cancelled = false;
+    setRangeAnalyzing(true);
+    setRangeAnalyzeError(null);
+
+    const timer = setTimeout(async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/admin/analyze-range`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: site, start: parsed.start, end: parsed.end }),
+        });
+        if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+        const data = await response.json();
+        if (cancelled) return;
+        setRangeAnalysis(data);
+        const codes = (data.languages || []).map((l) => l.code);
+        setRangeSelectedLanguages(new Set(codes.includes("en") ? ["en"] : codes));
+      } catch (err) {
+        if (cancelled) return;
+        console.error("Failed to analyze range:", err);
+        setRangeAnalysis(null);
+        setRangeAnalyzeError("Couldn't check that range. Check the URL and try again.");
+      } finally {
+        if (!cancelled) setRangeAnalyzing(false);
+      }
+    }, 500);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [range, urls]);
+
+  const toggleRangeLanguage = (code) => {
+    setRangeSelectedLanguages((prev) => {
+      const next = new Set(prev);
+      if (next.has(code)) next.delete(code);
+      else next.add(code);
+      return next;
+    });
+  };
+
+  // Debounced: whenever the pasted URL list changes AND no range is set
+  // (i.e. the "single scrape - exact URL(s)" path), fetch a language
+  // breakdown of just those pasted links so a checklist shows up under the
+  // textarea without requiring any extra click.
+  useEffect(() => {
+    const parsedRangeActive = parseRange(range);
+    const urlList = urls.split("\n").map((u) => u.trim()).filter(Boolean);
+
+    if (parsedRangeActive || urlList.length === 0) {
+      setPastedLanguages(null);
+      setPastedAnalyzing(false);
+      return;
+    }
+
+    let cancelled = false;
+    setPastedAnalyzing(true);
+
+    const timer = setTimeout(async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/admin/detect-languages`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ urls: urlList }),
+        });
+        if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
+        const data = await response.json();
+        if (cancelled) return;
+        setPastedLanguages(data.languages || []);
+        const codes = (data.languages || []).map((l) => l.code);
+        setPastedSelectedLanguages(new Set(codes.includes("en") ? ["en"] : codes));
+      } catch (err) {
+        if (cancelled) return;
+        console.error("Failed to detect languages for pasted URLs:", err);
+        setPastedLanguages(null);
+      } finally {
+        if (!cancelled) setPastedAnalyzing(false);
+      }
+    }, 500);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urls, range]);
+
+  const togglePastedLanguage = (code) => {
+    setPastedSelectedLanguages((prev) => {
+      const next = new Set(prev);
+      if (next.has(code)) next.delete(code);
+      else next.add(code);
+      return next;
+    });
+  };
+
   const handleDeepAnalyze = async () => {
     const site = firstUrl();
     if (!site) return;
@@ -486,6 +717,49 @@ function Admin() {
             rows={3}
             className="w-full bg-surface2 border border-border rounded-lg px-3 py-2 text-sm outline-none focus:border-accent placeholder:text-[#5c6672]"
           />
+
+          {!parseRange(range) && (pastedAnalyzing || (pastedLanguages && pastedLanguages.length > 0)) && (
+            <div className="bg-surface2 border border-border rounded-lg p-3 mt-2">
+              {pastedAnalyzing && !pastedLanguages && (
+                <p className="text-muted text-xs italic">Checking pasted URL(s) for language…</p>
+              )}
+              {pastedLanguages && pastedLanguages.length > 0 && (
+                <>
+                  <p className="text-[11px] uppercase tracking-wider text-muted font-mono mb-2">
+                    Languages found in the pasted URL(s) — tick which to scrape
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {pastedLanguages.map((lang) => {
+                      const checked = pastedSelectedLanguages.has(lang.code);
+                      return (
+                        <label
+                          key={lang.code}
+                          className={`flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border cursor-pointer transition ${
+                            checked
+                              ? "bg-accent/15 border-accent text-[#eef2f5]"
+                              : "bg-surface2 border-border text-muted hover:border-borderStrong"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => togglePastedLanguage(lang.code)}
+                            className="accent-accent"
+                          />
+                          {lang.name}
+                          <span className="text-[10px] opacity-70">({lang.count.toLocaleString()})</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  <p className="text-[11px] text-muted mt-2">
+                    This only applies to "Scrape & Index" below (exact URL(s), no range). Unticking a language drops
+                    matching pasted URL(s) before scraping.
+                  </p>
+                </>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="grid grid-cols-2 gap-4">
@@ -513,19 +787,74 @@ function Admin() {
 
         <div>
           <label className="text-sm font-medium text-[#dfe4e8] block mb-1.5">
-            Range — number of pages (optional)
+            Range — page range (optional)
           </label>
           <input
-            type="number"
-            min="1"
+            type="text"
             value={range}
             onChange={(e) => setRange(e.target.value)}
-            placeholder="e.g. 5 — leave blank to scrape only the pasted URL(s) above"
-            className="w-full max-w-[220px] bg-surface2 border border-border rounded-lg px-3 py-2 text-sm outline-none focus:border-accent placeholder:text-[#5c6672]"
+            placeholder="e.g. 1-200, then 201-400 next time — leave blank to scrape only the pasted URL(s) above"
+            className="w-full max-w-[420px] bg-surface2 border border-border rounded-lg px-3 py-2 text-sm outline-none focus:border-accent placeholder:text-[#5c6672]"
           />
           <p className="text-[11px] text-muted mt-1">
-            If set, scrapes this many pages from the site's sitemap. If empty, scrapes exactly the URL(s) above.
+            Enter a range like "1-200" to scrape that slice of the site's sitemap in order; run "201-400" next to
+            continue where it left off. Pages already stored in the DB are skipped automatically. A plain number
+            (e.g. "200") still works as shorthand for "1-200". Leave blank to scrape exactly the URL(s) above.
           </p>
+
+          {rangeAnalyzing && <p className="text-muted text-xs italic mt-2">Checking that range…</p>}
+          {rangeAnalyzeError && <p className="text-red-400 text-xs mt-2">{rangeAnalyzeError}</p>}
+
+          {rangeAnalysis && !rangeAnalyzing && (
+            <div className="bg-surface2 border border-border rounded-lg p-3 mt-2">
+              {rangeAnalysis.past_end_of_sitemap ? (
+                <p className="text-amber-400 text-xs font-semibold">
+                  ⚠ The sitemap only has {rangeAnalysis.total_pages_in_sitemap.toLocaleString()} page(s) — this range
+                  starts past the end of it.
+                </p>
+              ) : (
+                <>
+                  <p className="text-emerald-400 text-xs font-semibold">
+                    {rangeAnalysis.count_in_range.toLocaleString()} page(s) in range {rangeAnalysis.start}–
+                    {rangeAnalysis.end} of {rangeAnalysis.total_pages_in_sitemap.toLocaleString()} total —{" "}
+                    {rangeAnalysis.already_ingested_count.toLocaleString()} already ingested,{" "}
+                    {rangeAnalysis.new_count.toLocaleString()} new
+                  </p>
+                  {rangeAnalysis.languages && rangeAnalysis.languages.length > 0 && (
+                    <div className="mt-2">
+                      <p className="text-[11px] uppercase tracking-wider text-muted font-mono mb-2">
+                        Languages found in this range — tick which to scrape
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {rangeAnalysis.languages.map((lang) => {
+                          const checked = rangeSelectedLanguages.has(lang.code);
+                          return (
+                            <label
+                              key={lang.code}
+                              className={`flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border cursor-pointer transition ${
+                                checked
+                                  ? "bg-accent/15 border-accent text-[#eef2f5]"
+                                  : "bg-surface2 border-border text-muted hover:border-borderStrong"
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => toggleRangeLanguage(lang.code)}
+                                className="accent-accent"
+                              />
+                              {lang.name}
+                              <span className="text-[10px] opacity-70">({lang.count.toLocaleString()})</span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="flex gap-3 flex-wrap">
@@ -945,6 +1274,24 @@ function Admin() {
                 {dbStats.total_sources} source(s) · {dbStats.total_vectors} vector(s) · {dbStats.estimated_storage_mb} MB used
               </p>
             )}
+            {sources.length > 0 && selectedSourceIds.size > 0 && (
+              <button
+                onClick={handleBulkDelete}
+                disabled={bulkDeleting}
+                onBlur={() => setConfirmBulkDelete(false)}
+                className={`text-xs font-semibold px-3 py-1.5 rounded-lg border transition disabled:opacity-40 ${
+                  confirmBulkDelete
+                    ? "bg-red-500 text-white border-red-500 hover:bg-red-600"
+                    : "text-red-400 border-red-500/30 hover:bg-red-500/10"
+                }`}
+              >
+                {bulkDeleting
+                  ? "Deleting…"
+                  : confirmBulkDelete
+                  ? "Click again to confirm — permanent"
+                  : `Delete Selected (${selectedSourceIds.size})`}
+              </button>
+            )}
             {sources.length > 0 && (
               <button
                 onClick={handleDeleteAll}
@@ -971,6 +1318,14 @@ function Admin() {
             <table className="w-full text-sm">
               <thead className="bg-surface2 text-muted">
                 <tr>
+                  <th className="text-left px-4 py-2 font-medium w-8">
+                    <input
+                      type="checkbox"
+                      checked={sources.length > 0 && selectedSourceIds.size === sources.length}
+                      onChange={toggleSelectAllSources}
+                      className="accent-accent"
+                    />
+                  </th>
                   <th className="text-left px-4 py-2 font-medium">S.No</th>
                   <th className="text-left px-4 py-2 font-medium">URL</th>
                   <th className="text-left px-4 py-2 font-medium">Status</th>
@@ -980,7 +1335,18 @@ function Admin() {
               </thead>
               <tbody>
                 {sources.map((source, index) => (
-                  <tr key={source.id} className="border-t border-border">
+                  <tr
+                    key={source.id}
+                    className={`border-t border-border ${selectedSourceIds.has(source.id) ? "bg-accent/5" : ""}`}
+                  >
+                    <td className="px-4 py-2">
+                      <input
+                        type="checkbox"
+                        checked={selectedSourceIds.has(source.id)}
+                        onChange={() => toggleSourceSelected(source.id)}
+                        className="accent-accent"
+                      />
+                    </td>
                     <td className="px-4 py-2 text-muted">{index + 1}</td>
                     <td className="px-4 py-2 break-all font-mono text-xs text-[#dfe4e8]">{source.url}</td>
                     <td className="px-4 py-2">

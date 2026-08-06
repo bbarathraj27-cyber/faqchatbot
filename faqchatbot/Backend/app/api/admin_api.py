@@ -12,7 +12,7 @@ from app.models.source_model import Source
 from app.models.job_model import ScrapeJob  # noqa: F401
 from app.services import ingestion_pipeline
 from app.services.sitemap_service import analyze_site, analyze_site_deep
-from app.services.language_detection import filter_urls_by_language
+from app.services.language_detection import filter_urls_by_language, group_urls_by_language
 from app.services.verification_agent import verification_agent
 from app.services.verification_service import verify_source
 from app.services import scrape_job_service, control_signal
@@ -56,11 +56,38 @@ class FilterUrlsRequest(BaseModel):
     languages: list[str] = Field(...)
 
 
+class DetectLanguagesRequest(BaseModel):
+    urls: list[str] = Field(...)
+
+
 class RangeScrapeRequest(BaseModel):
     url: str = Field(...)
-    limit: int = Field(...)
+    # Legacy shape: scrape the first `limit` pages from the sitemap.
+    # Still supported so old clients keep working.
+    limit: int | None = Field(default=None)
+    # New shape: 1-indexed, inclusive page range against the site's
+    # (deterministically sorted) sitemap URL list, e.g. start=1, end=200
+    # then next batch start=201, end=400. This is what lets the range field
+    # accept "1-200", then "201-400" and actually continue where the
+    # previous batch left off, instead of always re-slicing from the top.
+    start: int | None = Field(default=None)
+    end: int | None = Field(default=None)
     question_selector: str | None = Field(default=None)
     answer_selector: str | None = Field(default=None)
+    # Optional language filter (URL-based, same detector used for
+    # Analyze & Bulk Import) scoped to just this range's pages.
+    languages: list[str] | None = Field(default=None)
+    # When true (default), URLs in the requested range that already have a
+    # Source row with status "success" are dropped before scraping, so
+    # re-entering an overlapping range (or nudging the numbers) never
+    # re-ingests a page that's already in the DB.
+    skip_already_ingested: bool = Field(default=True)
+
+
+class AnalyzeRangeRequest(BaseModel):
+    url: str = Field(...)
+    start: int = Field(..., ge=1)
+    end: int = Field(..., ge=1)
 
 
 @router.post("/scrape", response_model=ScrapeResponse)
@@ -108,6 +135,55 @@ def analyze_site_deep_endpoint(request: AnalyzeSiteRequest):
 def filter_urls_by_language_endpoint(request: FilterUrlsRequest):
     filtered = filter_urls_by_language(request.urls, request.languages)
     return {"urls": filtered, "count": len(filtered)}
+
+
+@router.post("/detect-languages")
+def detect_languages_endpoint(request: DetectLanguagesRequest):
+    """Language breakdown for a raw, user-pasted list of URLs (the "single
+    scrape" path) - no sitemap fetch involved, just URL-pattern detection
+    over exactly the links given. Powers the language checklist that shows
+    up as soon as URLs are pasted into the main textarea (range empty)."""
+    urls = [u.strip() for u in request.urls if u.strip()]
+    return {"languages": group_urls_by_language(urls), "count": len(urls)}
+
+
+@router.post("/analyze-range")
+def analyze_range_endpoint(request: AnalyzeRangeRequest, db: Session = Depends(get_db)):
+    """Given a 1-indexed page range like start=1,end=200, look at just that
+    slice of the sitemap and report which languages appear in it and how
+    many of those pages are already ingested - so the UI can show a
+    range-scoped language checklist before the user hits scrape."""
+    if request.end < request.start:
+        raise HTTPException(status_code=400, detail="Range end must be >= start")
+
+    site_info = analyze_site(request.url)
+    if not site_info["sitemap_found"]:
+        raise HTTPException(status_code=400, detail="Could not find a sitemap for that site")
+
+    all_urls = site_info["all_urls"]
+    total = len(all_urls)
+    # start/end are 1-indexed and inclusive, e.g. 1-200 then 201-400.
+    slice_urls = all_urls[request.start - 1:request.end]
+
+    already_ingested = 0
+    if slice_urls:
+        already_ingested = (
+            db.query(Source)
+            .filter(Source.url.in_(slice_urls), Source.status == "success")
+            .count()
+        )
+
+    return {
+        "total_pages_in_sitemap": total,
+        "start": request.start,
+        "end": min(request.end, total),
+        "requested_end": request.end,
+        "count_in_range": len(slice_urls),
+        "already_ingested_count": already_ingested,
+        "new_count": len(slice_urls) - already_ingested,
+        "languages": group_urls_by_language(slice_urls),
+        "past_end_of_sitemap": request.start > total,
+    }
 
 
 def _resume_sanity_check(db: Session, job: ScrapeJob, urls: list[str]) -> None:
@@ -391,20 +467,56 @@ def scrape_bulk_async(request: BulkScrapeRequest, background_tasks: BackgroundTa
 
 
 @router.post("/scrape-range-async")
-def scrape_range_async(request: RangeScrapeRequest, background_tasks: BackgroundTasks):
+def scrape_range_async(request: RangeScrapeRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     site_info = analyze_site(request.url)
     if not site_info["sitemap_found"]:
         raise HTTPException(status_code=400, detail="Could not find a sitemap for that site")
-    limited_urls = site_info["all_urls"][:request.limit]
-    if not limited_urls:
-        raise HTTPException(status_code=400, detail="No pages found to scrape")
+    all_urls = site_info["all_urls"]
+
+    if request.start is not None or request.end is not None:
+        if not request.start or not request.end:
+            raise HTTPException(status_code=400, detail="Both start and end are required for a page range")
+        if request.end < request.start:
+            raise HTTPException(status_code=400, detail="Range end must be >= start")
+        # 1-indexed, inclusive: start=1,end=200 then start=201,end=400 walks
+        # straight through the sitemap without re-scraping the earlier batch.
+        ranged_urls = all_urls[request.start - 1:request.end]
+    else:
+        # Legacy shape - first N pages.
+        if not request.limit:
+            raise HTTPException(status_code=400, detail="Provide either a page range (start/end) or a limit")
+        ranged_urls = all_urls[:request.limit]
+
+    if not ranged_urls:
+        raise HTTPException(status_code=400, detail="No pages found in that range")
+
+    if request.languages:
+        ranged_urls = filter_urls_by_language(ranged_urls, request.languages)
+        if not ranged_urls:
+            raise HTTPException(status_code=400, detail="No pages in that range match the selected language(s)")
+
+    if request.skip_already_ingested:
+        already_done = {
+            row[0] for row in (
+                db.query(Source.url)
+                .filter(Source.url.in_(ranged_urls), Source.status == "success")
+                .all()
+            )
+        }
+        ranged_urls = [u for u in ranged_urls if u not in already_done]
+        if not ranged_urls:
+            raise HTTPException(
+                status_code=400,
+                detail="Every page in that range is already ingested - try the next range instead",
+            )
+
     job = scrape_job_service.create_job(
-        urls=limited_urls,
+        urls=ranged_urls,
         question_selector=request.question_selector,
         answer_selector=request.answer_selector,
     )
     background_tasks.add_task(_run_bulk_scrape, job.id)
-    return {"job_id": job.id, "total_pages": len(limited_urls)}
+    return {"job_id": job.id, "total_pages": len(ranged_urls)}
 
 
 @router.get("/scrape-status/{job_id}")

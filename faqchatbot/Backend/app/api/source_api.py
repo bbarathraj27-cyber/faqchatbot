@@ -1,6 +1,7 @@
 import re
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -8,6 +9,10 @@ from app.models.source_model import Source
 from app.services import pinecone_service
 
 router = APIRouter(prefix="/sources", tags=["sources"])
+
+
+class BulkDeleteRequest(BaseModel):
+    ids: list[int] = Field(...)
 
 _CATEGORY_LABELS = {
     "guide": ("Guides & Concepts", "Core TensorFlow concepts, APIs, and how-tos."),
@@ -34,7 +39,11 @@ def _slug_to_label(url: str) -> str:
 
 @router.get("/")
 def list_sources(db: Session = Depends(get_db)):
-    return db.query(Source).order_by(Source.created_at.desc()).all()
+    # Ordered to match the site's sitemap order (same alphabetical sort
+    # analyze_site()/the Range tab use for page 1, 2, 3...) rather than
+    # scrape recency, so S.No lines up with "position on the site" and the
+    # homepage naturally lands at #1.
+    return db.query(Source).order_by(Source.url.asc()).all()
 
 
 @router.get("/stats")
@@ -104,6 +113,33 @@ def delete_all_sources(db: Session = Depends(get_db)):
     db.commit()
     pinecone_service.delete_all_chunks()
     return {"status": "all sources deleted"}
+
+
+@router.post("/delete-bulk")
+def delete_sources_bulk(request: BulkDeleteRequest, db: Session = Depends(get_db)):
+    """Deletes multiple sources (and their Pinecone vectors) by id in one
+    call, for the checkbox-select-then-delete flow in the admin table."""
+    if not request.ids:
+        raise HTTPException(status_code=400, detail="No source ids provided")
+
+    matched = db.query(Source).filter(Source.id.in_(request.ids)).all()
+    if not matched:
+        raise HTTPException(status_code=404, detail="No matching sources found")
+
+    deleted_ids = []
+    for source in matched:
+        try:
+            pinecone_service.delete_chunks_by_source(source.url)
+        except Exception:
+            # Don't let a Pinecone hiccup on one source block deleting the
+            # rest of the selection - the DB row still gets removed below,
+            # matching the tolerant style of the rest of this pipeline.
+            pass
+        db.delete(source)
+        deleted_ids.append(source.id)
+
+    db.commit()
+    return {"status": "deleted", "deleted_ids": deleted_ids, "count": len(deleted_ids)}
 
 
 @router.get("/{source_id}")
