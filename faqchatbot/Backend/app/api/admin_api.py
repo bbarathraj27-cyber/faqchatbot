@@ -10,7 +10,7 @@ from app.database import get_db, SessionLocal
 logger = logging.getLogger(__name__)
 from app.models.source_model import Source
 from app.models.job_model import ScrapeJob  # noqa: F401
-from app.services.ingestion_pipeline import ingest_website
+from app.services import ingestion_pipeline
 from app.services.sitemap_service import analyze_site, analyze_site_deep
 from app.services.language_detection import filter_urls_by_language
 from app.services.verification_agent import verification_agent
@@ -64,12 +64,12 @@ class RangeScrapeRequest(BaseModel):
 
 
 @router.post("/scrape", response_model=ScrapeResponse)
-def scrape_faq_source(request: ScrapeRequest, db: Session = Depends(get_db)):
+async def scrape_faq_source(request: ScrapeRequest, db: Session = Depends(get_db)):
     if not request.urls:
         raise HTTPException(status_code=400, detail="At least one URL is required")
 
     try:
-        result = ingest_website(
+        result = await ingestion_pipeline.ingest_website_async(
             urls=request.urls, question_selector=request.question_selector,
             answer_selector=request.answer_selector, crawl=request.crawl, max_pages=request.max_pages,
         )
@@ -225,7 +225,7 @@ def _run_bulk_scrape(job_id: str, is_resume: bool = False):
             # cooldowns.
             control_signal.set_current_job(job_id)
             try:
-                result = ingest_website(
+                result = ingestion_pipeline.ingest_website(
                     urls=[url],
                     question_selector=question_selector,
                     answer_selector=answer_selector,

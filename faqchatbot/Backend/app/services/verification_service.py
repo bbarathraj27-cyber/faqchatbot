@@ -22,6 +22,7 @@ sources that actually need correcting.
 
 import difflib
 import logging
+import asyncio
 from datetime import datetime, timezone
 
 from sqlalchemy.exc import OperationalError
@@ -29,7 +30,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import ObjectDeletedError, StaleDataError
 
 from app.models.source_model import Source
-from app.services.scraper_service import scrape_faq_page
+from app.services import scraper_service
 from app.services.cleaning_service import clean_text
 from app.services.chunking_service import chunk_qa_pair, chunk_long_text, Chunk
 from app.services.embedding_service import embed_texts
@@ -68,9 +69,14 @@ def compute_similarity(old_text: str, new_text: str) -> float:
 
 
 def _rescrape_and_chunk(url: str) -> list[Chunk]:
-    """Re-runs scrape -> clean -> chunk for a single URL, mirroring
-    ingest_website's per-page logic exactly."""
-    items = scrape_faq_page(url)
+    """Synchronous wrapper that mirrors the original behavior but
+    delegates to the async scraper. Runs the async implementation in a
+    temporary event loop so callers that expect sync behaviour keep working."""
+    return asyncio.run(_async_rescrape_and_chunk(url))
+
+
+async def _async_rescrape_and_chunk(url: str) -> list[Chunk]:
+    items = await scraper_service.async_scrape_faq_page(url)
     chunks: list[Chunk] = []
     for item in items:
         cleaned = clean_text(item.text)

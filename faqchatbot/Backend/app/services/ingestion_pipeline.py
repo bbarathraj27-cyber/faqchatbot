@@ -1,10 +1,11 @@
 import logging
 import time
-from app.services.scraper_service import scrape_multiple_pages, crawl_website
+import asyncio
+from app.services import scraper_service
 from app.services.cleaning_service import clean_text
 from app.services.chunking_service import chunk_qa_pair, chunk_long_text, Chunk
 from app.services.embedding_service import embed_texts
-from app.services.pinecone_service import ensure_index_exists, upsert_chunks
+from app.services import pinecone_service
 from app.services.neo4j_service import link_topics_from_texts_batch
 from app.services import control_signal
 
@@ -40,15 +41,35 @@ def ingest_website(
     budget (BATCH_RETRY_BUDGET_SECONDS in embedding_service.py) or a Groq
     cooldown stack visible in the logs instead of looking like a hang.
     """
+    # Keep existing synchronous API for callers that expect it by running
+    # the async ingestion entrypoint in a temporary event loop.
+    return asyncio.run(ingest_website_async(
+        urls=urls,
+        question_selector=question_selector,
+        answer_selector=answer_selector,
+        crawl=crawl,
+        max_pages=max_pages,
+        extract_topics=extract_topics,
+    ))
+
+
+async def ingest_website_async(
+    urls: list[str],
+    question_selector: str | None = None,
+    answer_selector: str | None = None,
+    crawl: bool = False,
+    max_pages: int = 20,
+    extract_topics: bool = True,
+) -> dict:
     control_signal.raise_if_abort_requested()
-    ensure_index_exists()
+    await pinecone_service.async_ensure_index_exists()
 
     control_signal.raise_if_abort_requested()
     t0 = time.time()
     if crawl:
-        scraped_items = crawl_website(urls, question_selector, answer_selector, max_pages=max_pages)
+        scraped_items = await scraper_service.async_crawl_website(urls, question_selector, answer_selector, max_pages=max_pages)
     else:
-        scraped_items = scrape_multiple_pages(urls, question_selector, answer_selector)
+        scraped_items = await scraper_service.async_scrape_multiple_pages(urls, question_selector, answer_selector)
     logger.info(f"[timing] Scrape took {time.time() - t0:.1f}s for {len(scraped_items)} item(s)")
 
     control_signal.raise_if_abort_requested()
@@ -92,13 +113,25 @@ def ingest_website(
     total_words = sum(len(chunk.text.split()) for chunk in all_chunks)
     texts = [chunk.text for chunk in all_chunks]
     t0 = time.time()
-    embeddings = embed_texts(texts)  # already raises AbortRequested internally mid-retry
+    # embed_texts is blocking — run it in a thread to avoid blocking the
+    # event loop in the async ingestion path.
+    embeddings = await asyncio.to_thread(embed_texts, texts)
     logger.info(f"[timing] Embedding (Gemini) took {time.time() - t0:.1f}s for {len(texts)} chunk(s)")
 
     control_signal.raise_if_abort_requested()
     t0 = time.time()
-    upsert_chunks(all_chunks, embeddings, topics_per_chunk)
+    await pinecone_service.async_upsert_chunks(all_chunks, embeddings, topics_per_chunk)
     logger.info(f"[timing] Pinecone upsert took {time.time() - t0:.1f}s")
+
+    try:
+        from app.services.groq_key_pool import get_fallback_metrics
+        metrics = get_fallback_metrics()
+        logger.info(
+            "fallback_metrics=%s",
+            metrics,
+        )
+    except Exception:
+        logger.debug("Could not collect fallback metrics")
 
     return {
         "pages_scraped": len(scraped_items), "chunks_created": len(all_chunks),

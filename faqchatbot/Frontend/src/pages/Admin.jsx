@@ -83,7 +83,9 @@ function Admin() {
       if (!response.ok) return;
       const data = await response.json();
       setVerificationStatus((prev) => {
-        if (data.running_pass || (prev && prev.running_pass && !data.running_pass)) {
+        const startedRun = prev && !prev.running_pass && data.running_pass;
+        const finishedRun = prev && prev.running_pass && !data.running_pass;
+        if (startedRun || finishedRun) {
           fetchSources();
           fetchDbStats();
         }
@@ -969,6 +971,7 @@ function Admin() {
             <table className="w-full text-sm">
               <thead className="bg-surface2 text-muted">
                 <tr>
+                  <th className="text-left px-4 py-2 font-medium">S.No</th>
                   <th className="text-left px-4 py-2 font-medium">URL</th>
                   <th className="text-left px-4 py-2 font-medium">Status</th>
                   <th className="text-left px-4 py-2 font-medium">Chunks</th>
@@ -976,8 +979,9 @@ function Admin() {
                 </tr>
               </thead>
               <tbody>
-                {sources.map((source) => (
+                {sources.map((source, index) => (
                   <tr key={source.id} className="border-t border-border">
+                    <td className="px-4 py-2 text-muted">{index + 1}</td>
                     <td className="px-4 py-2 break-all font-mono text-xs text-[#dfe4e8]">{source.url}</td>
                     <td className="px-4 py-2">
                       <span className={`px-2 py-0.5 rounded text-xs border ${

@@ -1,5 +1,6 @@
 import logging
 from pinecone import Pinecone, ServerlessSpec
+import asyncio
 
 from app.config import settings
 from app.services.chunking_service import Chunk
@@ -30,6 +31,10 @@ def ensure_index_exists() -> None:
             )
     except Exception as e:
         logger.warning(f"Could not ensure index exists: {e}")
+
+
+async def async_ensure_index_exists() -> None:
+    await asyncio.to_thread(ensure_index_exists)
 
 
 def _get_index():
@@ -87,6 +92,10 @@ def upsert_chunks(chunks: list[Chunk], embeddings: list[list[float]], topics_per
         logger.warning(f"Could not upsert chunks to Pinecone: {e}")
 
 
+async def async_upsert_chunks(chunks: list[Chunk], embeddings: list[list[float]], topics_per_chunk: list[list[str]] | None = None) -> None:
+    await asyncio.to_thread(upsert_chunks, chunks, embeddings, topics_per_chunk)
+
+
 def query_similar_chunks(query_embedding: list[float], top_k: int = 5) -> list[dict]:
     if not _pc:
         logger.warning("Pinecone not available, returning empty results")
@@ -110,6 +119,10 @@ def query_similar_chunks(query_embedding: list[float], top_k: int = 5) -> list[d
     except Exception as e:
         logger.warning(f"Could not query similar chunks: {e}")
         return []
+
+
+async def async_query_similar_chunks(query_embedding: list[float], top_k: int = 5) -> list[dict]:
+    return await asyncio.to_thread(query_similar_chunks, query_embedding, top_k)
 
 
 def query_by_topics(topics: list[str], top_k: int = 5) -> list[dict]:
@@ -149,6 +162,10 @@ def query_by_topics(topics: list[str], top_k: int = 5) -> list[dict]:
         return []
 
 
+async def async_query_by_topics(topics: list[str], top_k: int = 5) -> list[dict]:
+    return await asyncio.to_thread(query_by_topics, topics, top_k)
+
+
 def get_chunks_by_source(source_url: str, top_k: int = 10000) -> list[dict]:
     """
     Fetches every chunk currently stored for a given source_url, including
@@ -179,6 +196,10 @@ def get_chunks_by_source(source_url: str, top_k: int = 10000) -> list[dict]:
         return []
 
 
+async def async_get_chunks_by_source(source_url: str, top_k: int = 10000) -> list[dict]:
+    return await asyncio.to_thread(get_chunks_by_source, source_url, top_k)
+
+
 def delete_chunks_by_source(source_url: str) -> int:
     if not _pc:
         return 0
@@ -195,6 +216,10 @@ def delete_chunks_by_source(source_url: str) -> int:
     except Exception as e:
         logger.warning(f"Could not delete chunks for source {source_url}: {e}")
         return 0
+
+
+async def async_delete_chunks_by_source(source_url: str) -> int:
+    return await asyncio.to_thread(delete_chunks_by_source, source_url)
 
 
 def delete_chunks_by_ids(chunk_ids: list[str]) -> int:
@@ -218,6 +243,10 @@ def delete_chunks_by_ids(chunk_ids: list[str]) -> int:
         return 0
 
 
+async def async_delete_chunks_by_ids(chunk_ids: list[str]) -> int:
+    return await asyncio.to_thread(delete_chunks_by_ids, chunk_ids)
+
+
 def delete_all_chunks() -> None:
     if not _pc:
         return
@@ -226,6 +255,10 @@ def delete_all_chunks() -> None:
         index.delete(delete_all=True)
     except Exception as e:
         logger.warning(f"Could not delete all chunks: {e}")
+
+
+async def async_delete_all_chunks() -> None:
+    await asyncio.to_thread(delete_all_chunks)
 
 
 def get_index_stats() -> dict:
@@ -241,3 +274,7 @@ def get_index_stats() -> dict:
     except Exception as e:
         logger.warning(f"Could not get index stats: {e}")
         return {"total_vectors": 0, "estimated_storage_mb": 0.0}
+
+
+async def async_get_index_stats() -> dict:
+    return await asyncio.to_thread(get_index_stats)
