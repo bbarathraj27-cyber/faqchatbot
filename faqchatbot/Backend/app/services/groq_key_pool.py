@@ -195,6 +195,13 @@ def _resolve_keys() -> list[str]:
 groq_key_pool = GroqKeyPool(_resolve_keys())
 
 
+def refresh_groq_key_pool() -> None:
+    """Rebuild the pool from the latest settings so newly added keys are used."""
+    global groq_key_pool
+    keys = _resolve_keys()
+    groq_key_pool = GroqKeyPool(keys)
+
+
 def is_rate_limit_error(e: Exception) -> bool:
     msg = str(e)
     return "429" in msg or "rate_limit" in msg.lower() or "RESOURCE_EXHAUSTED" in msg

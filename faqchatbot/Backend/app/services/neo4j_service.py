@@ -1,5 +1,8 @@
 import json
 import logging
+import re
+from collections import Counter
+
 from neo4j import GraphDatabase
 from app.config import settings
 from app.prompts.topic_prompt import build_topic_extraction_prompt, build_batch_topic_extraction_prompt
@@ -102,6 +105,44 @@ def get_related_topics(topic: str, limit: int = 5) -> list[str]:
         return []
 
 
+def _clean_topic(topic: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", " ", topic.lower()).strip()
+    return cleaned.replace(" ", "_") if cleaned else ""
+
+
+def _heuristic_topics(text: str) -> list[str]:
+    """Add lightweight keyword hints when the LLM topics are weak or missing."""
+    if not text:
+        return []
+
+    tokens = re.findall(r"[a-z0-9]+(?:\.[a-z0-9]+)?", text.lower())
+    stopwords = {
+        "the", "and", "for", "with", "from", "into", "this", "that", "what", "when",
+        "where", "how", "use", "used", "using", "about", "your", "their", "there",
+        "have", "does", "doesn't", "don't", "can", "could", "should", "would", "also",
+        "each", "other", "than", "then", "than", "you", "are", "is", "be", "been",
+        "being", "will", "return", "returns", "method", "class", "function", "functions",
+        "module", "modules", "object", "objects", "example", "examples", "value", "values",
+    }
+
+    filtered = [t for t in tokens if len(t) > 2 and t not in stopwords]
+    counts = Counter(filtered)
+    candidates = []
+    for token, _ in counts.most_common(12):
+        if token not in candidates:
+            candidates.append(token)
+
+    # Add identifier-like hints from camelCase/underscored names.
+    for match in re.finditer(r"[A-Za-z][A-Za-z0-9_]*", text):
+        name = match.group(0)
+        if len(name) > 3 and not name.isupper():
+            normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower().replace("-", "_")
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+
+    return [_clean_topic(topic) for topic in candidates if _clean_topic(topic)][:4]
+
+
 def extract_topics(text: str, deadline: float | None = None) -> list[str]:
     """
     Uses the LLM to pull 2-4 topic keywords out of a chunk of text.
@@ -115,7 +156,13 @@ def extract_topics(text: str, deadline: float | None = None) -> list[str]:
         messages = build_topic_extraction_prompt(text[:2000])
         raw = chat_completion(messages, model=settings.LLM_MODEL, temperature=0.0, deadline=deadline)
         topics = [t.strip().lower() for t in raw.split(",") if t.strip()]
-        return topics[:4]
+        cleaned = [_clean_topic(t) for t in topics if _clean_topic(t)]
+        heuristic = _heuristic_topics(text)
+        combined = []
+        for topic in cleaned + heuristic:
+            if topic and topic not in combined:
+                combined.append(topic)
+        return combined[:4]
     except AbortRequested:
         # Must NOT be swallowed like a normal extraction failure - this is
         # pause/cancel firing mid-call. Let it propagate so the bulk-scrape

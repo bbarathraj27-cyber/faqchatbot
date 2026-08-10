@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import SourceList from "./SourceList";
@@ -81,6 +81,36 @@ const markdownComponents = {
 
 function AnswerCard({ chatLogId, question, answer, sources, fromCache }) {
   const [showSources, setShowSources] = useState(false);
+  const [typedAnswer, setTypedAnswer] = useState("");
+  const [typingComplete, setTypingComplete] = useState(false);
+
+  useEffect(() => {
+    let current = "";
+    let index = 0;
+    const speed = 18; // milliseconds per character
+    const total = answer.length;
+
+    setTypedAnswer("");
+    setTypingComplete(false);
+
+    if (!answer) {
+      setTypingComplete(true);
+      return;
+    }
+
+    const interval = setInterval(() => {
+      if (index >= total) {
+        clearInterval(interval);
+        setTypingComplete(true);
+        return;
+      }
+      current += answer[index];
+      index += 1;
+      setTypedAnswer(current);
+    }, speed);
+
+    return () => clearInterval(interval);
+  }, [answer]);
 
   return (
     <div className="bg-surface border border-border rounded-2xl px-6 py-5">
@@ -88,10 +118,13 @@ function AnswerCard({ chatLogId, question, answer, sources, fromCache }) {
       <p className="text-[15.5px] text-[#dfe4e8] mb-4 pb-4 border-b border-border">{question}</p>
 
       <p className="text-[11px] uppercase tracking-wider text-accent2 font-mono mb-1.5">Answer</p>
-      <div>
+      <div className="min-h-[90px]">
         <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-          {answer}
+          {typedAnswer}
         </ReactMarkdown>
+        {!typingComplete && (
+          <span className="inline-block animate-pulse text-[#8f98a4]">|</span>
+        )}
       </div>
 
       <div className="flex items-center justify-between mt-4 pt-3.5 border-t border-border">

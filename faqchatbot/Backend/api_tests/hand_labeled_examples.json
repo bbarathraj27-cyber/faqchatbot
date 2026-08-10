@@ -1,0 +1,14 @@
+[
+  {
+    "question": "How do I install TensorFlow with pip?",
+    "expected_source_url": "https://www.tensorflow.org/install"
+  },
+  {
+    "question": "What is tf.data used for?",
+    "expected_source_url": "https://www.tensorflow.org/guide/data"
+  },
+  {
+    "question": "How do I enable GPU support?",
+    "expected_source_url": "https://www.tensorflow.org/install/gpu"
+  }
+]

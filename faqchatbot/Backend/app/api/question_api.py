@@ -1,4 +1,5 @@
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -60,18 +61,109 @@ def _log_chat(db: Session, question: str, answer: str, sources: list[str]) -> in
 def _vector_search(corrected_question: str) -> list[dict]:
     """RAG leg: embed the question, then search Pinecone by vector similarity."""
     query_embedding = embed_text(corrected_question)
-    return query_similar_chunks(query_embedding, top_k=5)
+    return query_similar_chunks(query_embedding, top_k=12)
 
 
 def _graph_search(question_topics: list[str]) -> list[dict]:
     """KAG leg: expand the question's topics via Neo4j, then search Pinecone by topic match."""
     related_topics: list[str] = []
     if question_topics:
-        with ThreadPoolExecutor(max_workers=len(question_topics)) as executor:
-            for topics in executor.map(lambda t: get_related_topics(t, limit=3), question_topics):
+        with ThreadPoolExecutor(max_workers=min(len(question_topics), 4)) as executor:
+            for topics in executor.map(lambda t: get_related_topics(t, limit=5), question_topics):
                 related_topics.extend(topics)
-    related_topics = list(set(related_topics) - set(question_topics))
-    return query_by_topics(related_topics, top_k=3) if related_topics else []
+
+    related_topics = [t for t in dict.fromkeys(related_topics) if t not in set(question_topics)]
+    if not related_topics and question_topics:
+        related_topics = [t for t in dict.fromkeys(question_topics) if t]
+
+    return query_by_topics(related_topics, top_k=8) if related_topics else []
+
+
+def _tokenize(text: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", text.lower()) if len(token) > 2}
+
+
+def _lexical_overlap_score(question_text: str, question_topics: list[str], match: dict) -> float:
+    if not question_text and not question_topics:
+        return 0.0
+
+    question_tokens = _tokenize(question_text)
+    if not question_tokens and not question_topics:
+        return 0.0
+
+    chunk_text = " ".join([
+        match.get("text", ""),
+        match.get("question", ""),
+        " ".join(match.get("topics", []) or []),
+    ])
+    chunk_tokens = _tokenize(chunk_text)
+
+    overlap = len(question_tokens & chunk_tokens)
+    overlap_score = min(1.0, overlap / max(1, min(6, len(question_tokens))))
+
+    topic_overlap = 0
+    if question_topics and match.get("topics"):
+        topic_overlap = len(set(question_topics) & set(match.get("topics", [])))
+        topic_overlap = min(1.0, topic_overlap / max(1, min(3, len(question_topics))))
+
+    return overlap_score * 0.7 + topic_overlap * 0.3
+
+
+def rank_hybrid_matches(
+    vector_matches: list[dict],
+    graph_matches: list[dict],
+    top_k: int = 8,
+    question_text: str = "",
+    question_topics: list[str] | None = None,
+) -> list[dict]:
+    """Fuse vector and topic-based matches into a single ranked list.
+
+    The key improvement is to reward candidates that appear in both legs and to
+    preserve the more informative score from either leg while preventing a single
+    source from dominating the final ordering.
+    """
+    scored: dict[str, dict] = {}
+
+    for match in vector_matches:
+        key = match.get("id") or match["text"]
+        scored[key] = {
+            **match,
+            "_vector_score": float(match.get("score", 0.0) or 0.0),
+            "_graph_score": 0.0,
+            "_support": 0,
+        }
+
+    for match in graph_matches:
+        key = match.get("id") or match["text"]
+        if key not in scored:
+            scored[key] = {
+                **match,
+                "_vector_score": 0.0,
+                "_graph_score": float(match.get("score", 0.0) or 0.0),
+                "_support": 0,
+            }
+        else:
+            scored[key]["_support"] += 1
+            scored[key]["_graph_score"] = max(scored[key]["_graph_score"], float(match.get("score", 0.0) or 0.0))
+
+    for entry in scored.values():
+        entry["_support"] = int(entry.get("_support", 0))
+        entry["_lexical_score"] = _lexical_overlap_score(
+            question_text,
+            question_topics or [],
+            entry,
+        )
+        entry["_hybrid_score"] = (
+            (entry.get("_vector_score", 0.0) * 0.45)
+            + (entry.get("_graph_score", 0.0) * 0.30)
+            + (0.20 if entry.get("_support", 0) > 0 else 0.0)
+            + (0.10 if entry.get("_graph_score", 0.0) > 0.0 and entry.get("_vector_score", 0.0) > 0.0 else 0.0)
+            + (entry.get("_lexical_score", 0.0) * 0.70)
+            + (0.15 if entry.get("_lexical_score", 0.0) >= 0.75 else 0.0)
+        )
+
+    ranked = sorted(scored.values(), key=lambda item: item.get("_hybrid_score", 0.0), reverse=True)
+    return ranked[:top_k]
 
 
 def _retrieve(corrected_question: str, question_topics: list[str]) -> list[dict]:
@@ -86,11 +178,13 @@ def _retrieve(corrected_question: str, question_topics: list[str]) -> list[dict]
         vector_matches = vector_future.result()
         graph_matches = graph_future.result()
 
-    combined: dict[str, dict] = {}
-    for m in vector_matches + graph_matches:
-        key = m.get("id") or m["text"]
-        combined.setdefault(key, m)
-    return list(combined.values())
+    return rank_hybrid_matches(
+        vector_matches,
+        graph_matches,
+        top_k=12,
+        question_text=corrected_question,
+        question_topics=question_topics,
+    )
 
 class QuestionRequest(BaseModel):
     question: str
@@ -139,7 +233,6 @@ def ask_question(request: QuestionRequest, db: Session = Depends(get_db)):
         return QuestionResponse(answer=fallback, sources=[], from_cache=False, chat_log_id=chat_log_id)
 
     sources = list({m["source_url"] for m in all_matches if m["source_url"]})
-    result = {"answer": answer, "sources": sources}
 
     _NO_ANSWER_PHRASES = (
         "i don't know",
@@ -151,6 +244,11 @@ def ask_question(request: QuestionRequest, db: Session = Depends(get_db)):
         "trouble reaching the answer service",
     )
     is_no_answer = any(p in answer.lower() for p in _NO_ANSWER_PHRASES)
+
+    if is_no_answer:
+        sources = []
+
+    result = {"answer": answer, "sources": sources}
 
     if all_matches and fresh_signature and not is_no_answer:
         set_cached_answer(corrected_question, result, fresh_signature)

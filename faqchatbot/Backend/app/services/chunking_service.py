@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 import uuid
@@ -22,13 +23,39 @@ def truncate_to_tokens(text: str, max_tokens: int) -> str:
         return text
     return _decode(tokens[:max_tokens])
 
+def _normalize_chunk_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return text
+    return text.replace("\n", " ")
+
+
+def _split_into_segments(text: str) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+
+    sections = re.split(r"\n\s*\n", text)
+    segments: list[str] = []
+    for section in sections:
+        section = section.strip()
+        if not section:
+            continue
+        if re.match(r"^(#{1,6})\s+", section):
+            segments.append(section)
+        else:
+            segments.append(section)
+    return segments
+
+
 def chunk_qa_pair(question: str, answer: str, source_url: str) -> list[Chunk]:
     combined_text = f"Q: {question}\nA: {answer}"
 
     if _token_count(combined_text) > settings.CHUNK_SIZE_TOKENS * 1.5:
         return chunk_long_text(combined_text, source_url)
 
-    return [Chunk(chunk_id=str(uuid.uuid4()), text=combined_text, source_url=source_url, question=question)]
+    normalized = _normalize_chunk_text(combined_text)
+    return [Chunk(chunk_id=str(uuid.uuid4()), text=normalized, source_url=source_url, question=question)]
 
 
 def chunk_long_text(text: str, source_url: str) -> list[Chunk]:
@@ -40,16 +67,24 @@ def chunk_long_text(text: str, source_url: str) -> list[Chunk]:
         raise ValueError("CHUNK_SIZE_TOKENS must be greater than CHUNK_OVERLAP_TOKENS")
 
     chunks: list[Chunk] = []
-    start = 0
-    while start < len(tokens):
-        end = min(start + chunk_size, len(tokens))
-        chunk_tokens = tokens[start:end]
-        chunk_text = _decode(chunk_tokens)
+    segments = _split_into_segments(_decode(tokens))
+    if not segments:
+        return []
 
-        chunks.append(Chunk(chunk_id=str(uuid.uuid4()), text=chunk_text, source_url=source_url))
+    current = ""
+    for segment in segments:
+        candidate = f"{current}\n\n{segment}".strip() if current else segment
+        if _token_count(candidate) <= chunk_size:
+            current = candidate
+            continue
 
-        if end == len(tokens):
-            break
-        start = end - overlap
+        if current:
+            chunks.append(Chunk(chunk_id=str(uuid.uuid4()), text=_normalize_chunk_text(current), source_url=source_url))
+            current = segment
+        else:
+            current = segment
+
+    if current:
+        chunks.append(Chunk(chunk_id=str(uuid.uuid4()), text=_normalize_chunk_text(current), source_url=source_url))
 
     return chunks

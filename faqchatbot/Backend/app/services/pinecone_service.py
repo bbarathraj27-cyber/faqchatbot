@@ -60,7 +60,24 @@ def upsert_chunks(chunks: list[Chunk], embeddings: list[list[float]], topics_per
         skipped = 0
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             if all(v == 0.0 for v in embedding):
+                # Queue failed embedding for later retry instead of silently skipping.
                 skipped += 1
+                try:
+                    import json, os
+                    queue_path = os.path.join(os.path.dirname(__file__), "..", "..", "failed_embeddings_queue.jsonl")
+                    # Ensure path is normalized
+                    queue_path = os.path.abspath(queue_path)
+                    record = {
+                        "chunk_id": chunk.chunk_id,
+                        "text": chunk.text,
+                        "source_url": chunk.source_url,
+                        "question": chunk.question or "",
+                        "topics": topics_per_chunk[i] if topics_per_chunk else [],
+                    }
+                    with open(queue_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                except Exception:
+                    logger.exception("Failed to write failed chunk to retry queue")
                 continue
             topics = topics_per_chunk[i] if topics_per_chunk else []
             vectors.append({

@@ -35,6 +35,7 @@ HAND_LABELED_EXAMPLES below) alongside the synthetic set.
 """
 
 import argparse
+import json
 import random
 import statistics
 import sys
@@ -63,8 +64,9 @@ from app.services.llm_service import correct_and_extract_topics  # noqa: E402
 # This is the more trustworthy signal — fill in a few as you gather them.
 # ---------------------------------------------------------------------------
 HAND_LABELED_EXAMPLES: list[dict] = [
-    # {"question": "How do I install TensorFlow with pip?",
-    #  "expected_source_url": "https://www.tensorflow.org/install"},
+    {"question": "How do I install TensorFlow with pip?", "expected_source_url": "https://www.tensorflow.org/install"},
+    {"question": "What is tf.data used for?", "expected_source_url": "https://www.tensorflow.org/guide/data"},
+    {"question": "How do I enable GPU support?", "expected_source_url": "https://www.tensorflow.org/install/gpu"},
 ]
 
 
@@ -116,7 +118,27 @@ def sample_chunks(db: Session, sample_size: int) -> list[dict]:
     return chunks[:sample_size]
 
 
-def run_rag_kag_benchmark(sample_size: int, top_k: int) -> None:
+def summarize_ranking_results(ranks: list[int | None], latencies_ms: list[float], top_k: int) -> dict:
+    hits = [r for r in ranks if r is not None]
+    tested = len(ranks)
+    hit_rate = (len(hits) / tested) if tested else 0.0
+    mrr = (sum(1 / r for r in hits) / tested) if tested else 0.0
+    avg_latency = statistics.mean(latencies_ms) if latencies_ms else 0.0
+    p95_latency = (
+        statistics.quantiles(latencies_ms, n=20)[18] if len(latencies_ms) >= 20 else max(latencies_ms, default=0.0)
+    )
+    return {
+        "tested": tested,
+        "hits": len(hits),
+        "hit_rate": hit_rate,
+        "mrr": mrr,
+        "avg_latency_ms": avg_latency,
+        "p95_latency_ms": p95_latency,
+        "top_k": top_k,
+    }
+
+
+def run_rag_kag_benchmark(sample_size: int, top_k: int) -> dict:
     print(f"\n{'=' * 60}\nRAG + KAG RETRIEVAL BENCHMARK (synthetic, sample={sample_size}, top_k={top_k})\n{'=' * 60}")
     db = SessionLocal()
     try:
@@ -168,25 +190,22 @@ def run_rag_kag_benchmark(sample_size: int, top_k: int) -> None:
         print("No valid test cases were generated.")
         return
 
-    hits = [r for r in ranks if r is not None]
-    hit_rate = len(hits) / tested * 100
-    mrr = sum((1 / r) for r in hits) / tested if tested else 0.0
-    avg_latency = statistics.mean(latencies_ms) if latencies_ms else 0.0
-    p95_latency = (
-        statistics.quantiles(latencies_ms, n=20)[18] if len(latencies_ms) >= 20 else max(latencies_ms, default=0.0)
-    )
+    summary = summarize_ranking_results(ranks, latencies_ms, top_k)
+    hit_rate_pct = summary["hit_rate"] * 100
 
     print(f"\n{'-' * 60}")
-    print(f"Tested queries        : {tested}")
-    print(f"Hit Rate@{top_k}           : {hit_rate:.1f}%  ({len(hits)}/{tested})")
-    print(f"MRR                    : {mrr:.3f}")
-    print(f"Avg retrieval latency  : {avg_latency:.0f} ms")
-    print(f"P95 retrieval latency  : {p95_latency:.0f} ms")
+    print(f"Tested queries        : {summary['tested']}")
+    print(f"Hit Rate@{top_k}           : {hit_rate_pct:.1f}%  ({summary['hits']}/{summary['tested']})")
+    print(f"MRR                    : {summary['mrr']:.3f}")
+    print(f"Avg retrieval latency  : {summary['avg_latency_ms']:.0f} ms")
+    print(f"P95 retrieval latency  : {summary['p95_latency_ms']:.0f} ms")
     print(f"{'-' * 60}")
 
     if hand_labeled_results := run_hand_labeled(top_k):
         print("\nHand-labeled set results:")
         print(hand_labeled_results)
+
+    return summary
 
 
 def run_hand_labeled(top_k: int) -> str | None:
@@ -203,7 +222,7 @@ def run_hand_labeled(top_k: int) -> str | None:
     return f"{hits}/{total} correct ({hits / total * 100:.1f}%)"
 
 
-def run_cag_benchmark() -> None:
+def run_cag_benchmark() -> dict:
     print(f"\n{'=' * 60}\nCAG (Redis cache) CORRECTNESS + SPEED TEST\n{'=' * 60}")
 
     test_question = "What is TensorFlow used for?"
@@ -234,6 +253,14 @@ def run_cag_benchmark() -> None:
     else:
         print("Cache hit FAILED — Redis may be disconnected. Check REDIS_HOST/PASSWORD in .env.")
 
+    return {
+        "write_latency_ms": write_ms,
+        "miss_latency_ms": miss_ms,
+        "hit_latency_ms": hit_ms,
+        "cache_hit": cached is not None,
+        "signature_ok": bool(cached and cached.get("signature") == signature),
+    }
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark RAG+KAG retrieval accuracy and CAG cache behavior.")
@@ -242,6 +269,16 @@ if __name__ == "__main__":
     parser.add_argument("--skip-cag", action="store_true", help="Skip the Redis cache test")
     args = parser.parse_args()
 
-    run_rag_kag_benchmark(args.sample_size, args.top_k)
+    rag_summary = run_rag_kag_benchmark(args.sample_size, args.top_k)
     if not args.skip_cag:
-        run_cag_benchmark()
+        cag_summary = run_cag_benchmark()
+    else:
+        cag_summary = None
+
+    report = {
+        "workflow": "RAG+KAG+CAG",
+        "rag_kag": rag_summary,
+        "cag": cag_summary,
+    }
+    print(f"\n{'=' * 60}\nFINAL BENCHMARK REPORT\n{'=' * 60}")
+    print(json.dumps(report, indent=2))
