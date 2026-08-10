@@ -70,7 +70,9 @@ async def ping_redis():
     value = await r.get("foo")
     return {"foo": value}
 
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIST = os.path.join(BASE_DIR, "..", "..", "Frontend", "dist")
-app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="static")
+if os.path.isdir(FRONTEND_DIST):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="static")
+else:
+    logger.warning(f"Frontend dist folder not found at {FRONTEND_DIST}, skipping static file mount")
