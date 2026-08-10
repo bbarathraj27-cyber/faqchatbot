@@ -17,6 +17,7 @@ function Admin() {
   const [questionSelector, setQuestionSelector] = useState("");
   const [answerSelector, setAnswerSelector] = useState("");
   const [range, setRange] = useState("");
+  const [renderJs, setRenderJs] = useState(false);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
@@ -388,6 +389,7 @@ function Admin() {
             end: parsedRange.end,
             question_selector: questionSelector || null,
             answer_selector: answerSelector || null,
+            render_js: renderJs,
             // Only send a language filter once we actually know what
             // languages are in this range (rangeAnalysis loaded) - avoids
             // accidentally restricting to the stale default ["en"] before
@@ -444,6 +446,7 @@ function Admin() {
             urls: urlList,
             question_selector: questionSelector || null,
             answer_selector: answerSelector || null,
+            render_js: renderJs,
           }),
         });
         if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
@@ -677,7 +680,7 @@ function Admin() {
       const response = await fetch(`${API_BASE_URL}/admin/scrape-bulk-async`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ urls: filteredUrls }),
+        body: JSON.stringify({ urls: filteredUrls, render_js: renderJs }),
       });
       if (!response.ok) throw new Error(`Request failed with status ${response.status}`);
       const data = await response.json();
@@ -784,6 +787,22 @@ function Admin() {
               className="w-full bg-surface2 border border-border rounded-lg px-3 py-2 text-sm outline-none focus:border-accent placeholder:text-[#5c6672]"
             />
           </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            id="render-js-checkbox"
+            checked={renderJs}
+            onChange={(e) => setRenderJs(e.target.checked)}
+            className="w-4 h-4 accent-accent"
+          />
+          <label htmlFor="render-js-checkbox" className="text-sm font-medium text-[#dfe4e8] cursor-pointer">
+            Render JavaScript (for SPA / JS-heavy sites)
+          </label>
+          <span className="text-[11px] text-muted">
+            — slower per page; only force this on if a site returns near-empty content without it
+          </span>
         </div>
 
         <div>

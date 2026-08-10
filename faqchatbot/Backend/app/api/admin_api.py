@@ -46,6 +46,11 @@ class ScrapeResponse(BaseModel):
 class BulkScrapeRequest(BaseModel):
     urls: list[str] = Field(...)
     render_js: bool = Field(default=False)
+    # Same behavior as range scraping: drop URLs that already have a
+    # Source row with status "success" before creating the job, so
+    # re-running bulk scrape on the same site (e.g. ~18k pages) never
+    # re-scrapes pages that are already ingested.
+    skip_already_ingested: bool = Field(default=True)
 
 
 class AnalyzeSiteRequest(BaseModel):
@@ -464,12 +469,29 @@ def _safe_commit(db: Session, job_id: str) -> None:
 
 
 @router.post("/scrape-bulk-async")
-def scrape_bulk_async(request: BulkScrapeRequest, background_tasks: BackgroundTasks):
+def scrape_bulk_async(request: BulkScrapeRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     if not request.urls:
         raise HTTPException(status_code=400, detail="No URLs provided")
-    job = scrape_job_service.create_job(urls=request.urls, render_js=request.render_js)
+
+    urls = request.urls
+    if request.skip_already_ingested:
+        already_done = {
+            row[0] for row in (
+                db.query(Source.url)
+                .filter(Source.url.in_(urls), Source.status == "success")
+                .all()
+            )
+        }
+        urls = [u for u in urls if u not in already_done]
+        if not urls:
+            raise HTTPException(
+                status_code=400,
+                detail="Every URL here is already ingested - nothing new to scrape",
+            )
+
+    job = scrape_job_service.create_job(urls=urls, render_js=request.render_js)
     background_tasks.add_task(_run_bulk_scrape, job.id)
-    return {"job_id": job.id, "total_pages": len(request.urls)}
+    return {"job_id": job.id, "total_pages": len(urls)}
 
 
 @router.post("/scrape-range-async")
