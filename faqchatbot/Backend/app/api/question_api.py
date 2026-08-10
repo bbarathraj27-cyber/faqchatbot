@@ -181,7 +181,7 @@ def _retrieve(corrected_question: str, question_topics: list[str]) -> list[dict]
     return rank_hybrid_matches(
         vector_matches,
         graph_matches,
-        top_k=6,
+        top_k=3,
         question_text=corrected_question,
         question_topics=question_topics,
     )
