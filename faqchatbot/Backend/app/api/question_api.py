@@ -181,7 +181,7 @@ def _retrieve(corrected_question: str, question_topics: list[str]) -> list[dict]
     return rank_hybrid_matches(
         vector_matches,
         graph_matches,
-        top_k=12,
+        top_k=6,
         question_text=corrected_question,
         question_topics=question_topics,
     )
@@ -232,7 +232,12 @@ def ask_question(request: QuestionRequest, db: Session = Depends(get_db)):
         chat_log_id = _log_chat(db, corrected_question, fallback, [])
         return QuestionResponse(answer=fallback, sources=[], from_cache=False, chat_log_id=chat_log_id)
 
-    sources = list({m["source_url"] for m in all_matches if m["source_url"]})
+    RELEVANCE_THRESHOLD = 0.35
+    sources = list({
+        m["source_url"]
+        for m in all_matches
+        if m["source_url"] and m.get("_hybrid_score", 0.0) >= RELEVANCE_THRESHOLD
+    })
 
     _NO_ANSWER_PHRASES = (
         "i don't know",
