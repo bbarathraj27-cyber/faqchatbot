@@ -4,6 +4,7 @@ const getAPIBaseURL = () => {
   const hostname = window.location.hostname;
   const protocol = window.location.protocol;
   if (hostname === "localhost" || hostname === "127.0.0.1") return "http://localhost:8000";
+  if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL;
   if (hostname.includes("app.github.dev")) return `${protocol}//${hostname.replace(/-5173\./, "-8000.")}`;
   const origin = window.location.origin;
   if (origin.includes(":5173")) return origin.replace(":5173", ":8000");

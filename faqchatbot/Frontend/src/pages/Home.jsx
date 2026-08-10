@@ -10,6 +10,9 @@ const getAPIBaseURL = () => {
   if (hostname === "localhost" || hostname === "127.0.0.1") {
     return "http://localhost:8000";
   }
+  if (import.meta.env.VITE_API_URL) {
+    return import.meta.env.VITE_API_URL;
+  }
   if (hostname.includes("app.github.dev")) {
     return `${protocol}//${hostname.replace(/-5173\./, "-8000.")}`;
   }
