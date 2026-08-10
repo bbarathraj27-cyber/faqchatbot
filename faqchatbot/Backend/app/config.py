@@ -15,10 +15,6 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "gemini-embedding-001"
 
     # --- Gemini (LLM fallback, used only when Groq fails) ---
-    # Dedicated key pool for chat fallback, kept separate from GEMINI_API_KEYS
-    # (embeddings) so a heavy ingest run hammering the embedding pool can
-    # never starve out a live chat fallback. If left empty, falls back to
-    # reusing GEMINI_API_KEYS (see gemini_llm_key_pool.py _resolve_keys()).
     GEMINI_LLM_API_KEYS: str = ""
     GEMINI_LLM_MODEL: str = "gemini-2.5-flash"
     LLM_FALLBACK_TO_GEMINI: bool = True
@@ -63,6 +59,19 @@ class Settings(BaseSettings):
 
     # --- CORS ---
     CORS_ALLOWED_ORIGINS: str = "*"
+
+    # --- Scraper: JS rendering ---
+    SCRAPER_JS_RENDER_ENABLED: bool = True
+    # If a static fetch returns less than this many characters of visible
+    # text, we assume the page is a JS-rendered SPA and retry with a
+    # headless browser instead of trusting the (likely empty) static HTML.
+    SCRAPER_JS_FALLBACK_MIN_TEXT_LENGTH: int = 200
+    SCRAPER_JS_RENDER_TIMEOUT_MS: int = 20000
+
+    # --- Scraper: anti-bot handling ---
+    SCRAPER_MAX_RETRIES: int = 3
+    SCRAPER_RETRY_BACKOFF_BASE_SECONDS: float = 1.5
+    SCRAPER_MIN_DELAY_SECONDS: float = 0.5  # politeness delay between requests in a crawl
 
     class Config:
         env_file = ".env"

@@ -10,6 +10,7 @@ class ScrapeJob(Base):
     urls_json = Column(Text, nullable=False)
     question_selector = Column(String, nullable=True)
     answer_selector = Column(String, nullable=True)
+    render_js = Column(Boolean, default=False)
     status = Column(String, default="running", index=True)
     total_pages = Column(Integer, default=0)
     current_index = Column(Integer, default=0)

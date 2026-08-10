@@ -32,6 +32,7 @@ class ScrapeRequest(BaseModel):
     answer_selector: str | None = Field(default=None)
     crawl: bool = Field(default=False)
     max_pages: int = Field(default=20)
+    render_js: bool = Field(default=False)
 
 
 class ScrapeResponse(BaseModel):
@@ -44,6 +45,7 @@ class ScrapeResponse(BaseModel):
 
 class BulkScrapeRequest(BaseModel):
     urls: list[str] = Field(...)
+    render_js: bool = Field(default=False)
 
 
 class AnalyzeSiteRequest(BaseModel):
@@ -74,6 +76,7 @@ class RangeScrapeRequest(BaseModel):
     end: int | None = Field(default=None)
     question_selector: str | None = Field(default=None)
     answer_selector: str | None = Field(default=None)
+    render_js: bool = Field(default=False)
     # Optional language filter (URL-based, same detector used for
     # Analyze & Bulk Import) scoped to just this range's pages.
     languages: list[str] | None = Field(default=None)
@@ -99,6 +102,7 @@ async def scrape_faq_source(request: ScrapeRequest, db: Session = Depends(get_db
         result = await ingestion_pipeline.ingest_website_async(
             urls=request.urls, question_selector=request.question_selector,
             answer_selector=request.answer_selector, crawl=request.crawl, max_pages=request.max_pages,
+            render_js=request.render_js,
         )
     except Exception as e:
         logger.exception("ingest_website failed")
@@ -260,6 +264,7 @@ def _run_bulk_scrape(job_id: str, is_resume: bool = False):
         urls = job.urls
         question_selector = job.question_selector
         answer_selector = job.answer_selector
+        render_js = job.render_js
         total_chunks = job.chunks_created
         total_words = job.total_words
         consecutive_errors = job.consecutive_errors or 0
@@ -305,6 +310,7 @@ def _run_bulk_scrape(job_id: str, is_resume: bool = False):
                     urls=[url],
                     question_selector=question_selector,
                     answer_selector=answer_selector,
+                    render_js=render_js,
                     # extract_topics=False: bulk ingestion must never depend on
                     # the Groq topic-extraction call. With ~18.8k URLs, leaving
                     # this on burns through all Groq keys' daily token quota
@@ -461,7 +467,7 @@ def _safe_commit(db: Session, job_id: str) -> None:
 def scrape_bulk_async(request: BulkScrapeRequest, background_tasks: BackgroundTasks):
     if not request.urls:
         raise HTTPException(status_code=400, detail="No URLs provided")
-    job = scrape_job_service.create_job(urls=request.urls)
+    job = scrape_job_service.create_job(urls=request.urls, render_js=request.render_js)
     background_tasks.add_task(_run_bulk_scrape, job.id)
     return {"job_id": job.id, "total_pages": len(request.urls)}
 
@@ -514,6 +520,7 @@ def scrape_range_async(request: RangeScrapeRequest, background_tasks: Background
         urls=ranged_urls,
         question_selector=request.question_selector,
         answer_selector=request.answer_selector,
+        render_js=request.render_js,
     )
     background_tasks.add_task(_run_bulk_scrape, job.id)
     return {"job_id": job.id, "total_pages": len(ranged_urls)}

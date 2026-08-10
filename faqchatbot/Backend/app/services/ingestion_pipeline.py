@@ -19,6 +19,7 @@ def ingest_website(
     crawl: bool = False,
     max_pages: int = 20,
     extract_topics: bool = True,
+    render_js: bool = False,
 ) -> dict:
     """
     Checked at every major step boundary (not a param anymore - uses
@@ -50,6 +51,7 @@ def ingest_website(
         crawl=crawl,
         max_pages=max_pages,
         extract_topics=extract_topics,
+        render_js=render_js,
     ))
 
 
@@ -60,6 +62,7 @@ async def ingest_website_async(
     crawl: bool = False,
     max_pages: int = 20,
     extract_topics: bool = True,
+    render_js: bool = False,
 ) -> dict:
     control_signal.raise_if_abort_requested()
     await pinecone_service.async_ensure_index_exists()
@@ -67,9 +70,9 @@ async def ingest_website_async(
     control_signal.raise_if_abort_requested()
     t0 = time.time()
     if crawl:
-        scraped_items = await scraper_service.async_crawl_website(urls, question_selector, answer_selector, max_pages=max_pages)
+        scraped_items = await scraper_service.async_crawl_website(urls, question_selector, answer_selector, max_pages=max_pages, render_js=render_js)
     else:
-        scraped_items = await scraper_service.async_scrape_multiple_pages(urls, question_selector, answer_selector)
+        scraped_items = await scraper_service.async_scrape_multiple_pages(urls, question_selector, answer_selector, render_js=render_js)
     logger.info(f"[timing] Scrape took {time.time() - t0:.1f}s for {len(scraped_items)} item(s)")
 
     control_signal.raise_if_abort_requested()

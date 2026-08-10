@@ -17,6 +17,7 @@ def create_job(
     urls: list[str],
     question_selector: str | None = None,
     answer_selector: str | None = None,
+    render_js: bool = False,
 ) -> ScrapeJob:
     db = SessionLocal()
     try:
@@ -25,6 +26,7 @@ def create_job(
             urls_json=json.dumps(urls),
             question_selector=question_selector,
             answer_selector=answer_selector,
+            render_js=render_js,
             status="running",
             total_pages=len(urls),
             current_index=0,
@@ -174,9 +176,6 @@ def mark_resuming(job_id: str) -> ScrapeJob | None:
         job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
         if not job or job.status != "paused":
             return None
-        # Belt-and-suspenders: clear any stale in-memory flag before the
-        # background task starts, in case a race left one set from the
-        # previous run of this same job_id.
         control_signal.clear_signals(job_id)
         job.status = "running"
         job.pause_requested = False
