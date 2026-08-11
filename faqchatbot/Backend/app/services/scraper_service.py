@@ -13,6 +13,13 @@ import asyncio
 from bs4 import BeautifulSoup
 
 from app.config import settings
+from app.services.robots_service import (
+    RobotsDisallowedError,
+    is_allowed,
+    async_is_allowed,
+    get_crawl_delay,
+    async_get_crawl_delay,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,8 +136,12 @@ def _extract_faq_jsonld(url: str, soup: BeautifulSoup) -> list["ScrapedItem"]:
 
 
 def fetch_html(url: str) -> str:
-    """Sync fetch with anti-bot retry/backoff + UA rotation."""
+    """Sync fetch with anti-bot retry/backoff + UA rotation. Honors robots.txt."""
     import time
+
+    if not is_allowed(url):
+        logger.info(f"[scraper] robots.txt disallows fetching {url}")
+        raise RobotsDisallowedError(url)
 
     last_exc: Exception | None = None
     for attempt in range(settings.SCRAPER_MAX_RETRIES + 1):
@@ -155,14 +166,18 @@ def fetch_html(url: str) -> str:
 
 async def async_fetch_html(url: str, client: httpx.AsyncClient | None = None) -> str:
     """Async HTTP fetch. Rotates UA per attempt, retries on 403/429/5xx
-    with exponential backoff + jitter, honors Retry-After."""
+    with exponential backoff + jitter, honors Retry-After. Honors robots.txt."""
     own_client = False
     if client is None:
         client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True)
         own_client = True
 
-    last_exc: Exception | None = None
     try:
+        if not await async_is_allowed(url, client=client):
+            logger.info(f"[scraper] robots.txt disallows fetching {url}")
+            raise RobotsDisallowedError(url)
+
+        last_exc: Exception | None = None
         for attempt in range(settings.SCRAPER_MAX_RETRIES + 1):
             try:
                 resp = await client.get(url, headers=_build_headers(), follow_redirects=True)
@@ -192,7 +207,11 @@ async def async_fetch_html(url: str, client: httpx.AsyncClient | None = None) ->
 
 async def async_fetch_html_js(url: str, timeout_ms: int | None = None) -> str:
     """Fetch a page's fully-rendered DOM using headless Chromium (Playwright).
-    Requires `playwright install chromium` to have been run once."""
+    Requires `playwright install chromium` to have been run once. Honors robots.txt."""
+    if not await async_is_allowed(url):
+        logger.info(f"[scraper] robots.txt disallows fetching {url}")
+        raise RobotsDisallowedError(url)
+
     try:
         from playwright.async_api import async_playwright
     except ImportError as exc:
@@ -315,7 +334,8 @@ async def async_scrape_multiple_pages(
                 all_items.extend(items)
             except (httpx.HTTPError, RuntimeError) as exc:
                 logger.warning(f"[scraper] Failed to scrape {url}: {exc}")
-            await asyncio.sleep(settings.SCRAPER_MIN_DELAY_SECONDS)  # politeness delay
+            delay = max(settings.SCRAPER_MIN_DELAY_SECONDS, await async_get_crawl_delay(url, client=client) or 0)
+            await asyncio.sleep(delay)  # politeness delay, extended if robots.txt asks for more
     return all_items
 
 
@@ -396,7 +416,8 @@ def crawl_website(
 
         all_items.extend(page_items)
         logger.info(f"[crawler] Scraped ({len(visited)}/{max_pages}): {url}")
-        time.sleep(settings.SCRAPER_MIN_DELAY_SECONDS)  # politeness delay
+        delay = max(settings.SCRAPER_MIN_DELAY_SECONDS, get_crawl_delay(url) or 0)
+        time.sleep(delay)  # politeness delay, extended if robots.txt asks for more
 
         try:
             new_links = _extract_links(url, html)
@@ -461,7 +482,8 @@ async def async_crawl_website(
 
             all_items.extend(page_items)
             logger.info(f"[crawler] Scraped ({len(visited)}/{max_pages}): {url}")
-            await asyncio.sleep(settings.SCRAPER_MIN_DELAY_SECONDS)  # politeness delay
+            delay = max(settings.SCRAPER_MIN_DELAY_SECONDS, await async_get_crawl_delay(url, client=client) or 0)
+            await asyncio.sleep(delay)  # politeness delay, extended if robots.txt asks for more
 
             try:
                 new_links = _extract_links(url, html)

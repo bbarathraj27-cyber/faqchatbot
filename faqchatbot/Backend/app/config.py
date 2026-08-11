@@ -73,6 +73,16 @@ class Settings(BaseSettings):
     SCRAPER_RETRY_BACKOFF_BASE_SECONDS: float = 1.5
     SCRAPER_MIN_DELAY_SECONDS: float = 0.5  # politeness delay between requests in a crawl
 
+    # --- Scraper: robots.txt compliance ---
+    SCRAPER_RESPECT_ROBOTS_TXT: bool = True
+    # Identity used both for the User-Agent sent when fetching robots.txt
+    # itself, and for matching User-agent: groups inside it.
+    SCRAPER_ROBOTS_USER_AGENT: str = "FAQChatbotScraper"
+    SCRAPER_ROBOTS_FETCH_TIMEOUT_SECONDS: float = 10.0
+    # If robots.txt can't be fetched at all (timeout, DNS error, 5xx), should
+    # we still crawl? True = fail-open (allow), False = fail-closed (skip).
+    SCRAPER_ROBOTS_FAIL_OPEN: bool = True
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
