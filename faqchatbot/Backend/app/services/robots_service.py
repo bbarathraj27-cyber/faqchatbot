@@ -114,7 +114,12 @@ def is_allowed(url: str) -> bool:
     if parser is None:
         return settings.SCRAPER_ROBOTS_FAIL_OPEN
     try:
-        return parser.can_fetch(settings.SCRAPER_ROBOTS_USER_AGENT, url)
+        allowed = parser.can_fetch(settings.SCRAPER_ROBOTS_USER_AGENT, url)
+        if allowed:
+            logger.info(f"[robots] Allowed by robots.txt: {url}")
+        else:
+            logger.info(f"[robots] Disallowed by robots.txt: {url}")
+        return allowed
     except Exception as exc:  # malformed robots.txt shouldn't crash a crawl
         logger.warning(f"[robots] Error evaluating rules for {url} ({exc}); failing open")
         return True
@@ -191,7 +196,12 @@ async def async_is_allowed(url: str, client: Optional[httpx.AsyncClient] = None)
     if parser is None:
         return settings.SCRAPER_ROBOTS_FAIL_OPEN
     try:
-        return parser.can_fetch(settings.SCRAPER_ROBOTS_USER_AGENT, url)
+        allowed = parser.can_fetch(settings.SCRAPER_ROBOTS_USER_AGENT, url)
+        if allowed:
+            logger.info(f"[robots] Allowed by robots.txt: {url}")
+        else:
+            logger.info(f"[robots] Disallowed by robots.txt: {url}")
+        return allowed
     except Exception as exc:
         logger.warning(f"[robots] Error evaluating rules for {url} ({exc}); failing open")
         return True

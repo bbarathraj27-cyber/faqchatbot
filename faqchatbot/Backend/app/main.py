@@ -1,5 +1,15 @@
 import os
 import logging
+
+# Must run before any app.* module grabs a logger, otherwise their INFO-level
+# calls (e.g. the [robots]/[scraper] lines in robots_service.py and
+# scraper_service.py) have no handler to print through and are silently
+# dropped — Python's root logger defaults to WARNING with no handler at all.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles

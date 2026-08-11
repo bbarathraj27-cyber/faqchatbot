@@ -58,6 +58,30 @@ def chunk_qa_pair(question: str, answer: str, source_url: str) -> list[Chunk]:
     return [Chunk(chunk_id=str(uuid.uuid4()), text=normalized, source_url=source_url, question=question)]
 
 
+def _split_oversized_segment(segment: str, chunk_size: int, overlap: int) -> list[str]:
+    """Hard-splits a single segment into token-sized pieces when it's already
+    bigger than chunk_size on its own (e.g. a raw-text-fallback scrape with no
+    blank-line paragraph breaks, so _split_into_segments returns it as one
+    giant segment). Without this, that segment flows through the merge loop
+    below untouched and becomes one oversized chunk - which is exactly how a
+    17k-word page turned into a single ~95KB chunk that blew past Pinecone's
+    40KB-per-vector metadata limit and silently failed to upsert."""
+    tokens = _encode(segment)
+    if len(tokens) <= chunk_size:
+        return [segment]
+
+    pieces = []
+    step = chunk_size - overlap
+    for start in range(0, len(tokens), step):
+        piece_tokens = tokens[start : start + chunk_size]
+        if not piece_tokens:
+            break
+        pieces.append(_decode(piece_tokens))
+        if start + chunk_size >= len(tokens):
+            break
+    return pieces
+
+
 def chunk_long_text(text: str, source_url: str) -> list[Chunk]:
     tokens = _encode(text)
     chunk_size = settings.CHUNK_SIZE_TOKENS
@@ -67,9 +91,13 @@ def chunk_long_text(text: str, source_url: str) -> list[Chunk]:
         raise ValueError("CHUNK_SIZE_TOKENS must be greater than CHUNK_OVERLAP_TOKENS")
 
     chunks: list[Chunk] = []
-    segments = _split_into_segments(_decode(tokens))
-    if not segments:
+    raw_segments = _split_into_segments(_decode(tokens))
+    if not raw_segments:
         return []
+
+    segments: list[str] = []
+    for seg in raw_segments:
+        segments.extend(_split_oversized_segment(seg, chunk_size, overlap))
 
     current = ""
     for segment in segments:
